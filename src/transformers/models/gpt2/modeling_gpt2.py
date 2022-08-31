@@ -53,6 +53,12 @@ from ...utils import (
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
 from .configuration_gpt2 import GPT2Config
 
+from enum import Enum
+class AttentionType(Enum):
+    MULTI_HEAD = 1
+    MULTI_QUERY = 2
+    MULTI_QUERY_1 = 3
+
 
 logger = logging.get_logger(__name__)
 
@@ -139,11 +145,28 @@ class GPT2Attention(nn.Module):
             ),
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4))
+        
+        if hasattr(config, 'attention_type'):
+            self.attention_type = config.attention_type
+        else:
+            self.attention_type = AttentionType.MULTI_HEAD
 
+        assert (
+            self.attention_type == AttentionType.MULTI_HEAD or
+            self.attention_type == AttentionType.MULTI_QUERY or
+            self.attention_type == AttentionType.MULTI_QUERY_1
+        )
+
+        if hasattr(config, 'print_details') and config.print_details is True:
+            self.print_details = layer_idx == 0
+        else:
+            self.print_details = False
+        
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.split_size = self.embed_dim
+        
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
                 f"`embed_dim` must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
@@ -157,18 +180,37 @@ class GPT2Attention(nn.Module):
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
+        if self.reorder_and_upcast_attn and self.attention_type != AttentionType.MULTI_HEAD:
+                raise NotImplementedError(f'attention_type {self.attention_type} for reorder_and_upcast_attn')
 
         if self.is_cross_attention:
+            if self.attention_type != AttentionType.MULTI_HEAD:
+                raise NotImplementedError(f'attention_type {self.attention_type}  for cross_attention')
+
             self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
             self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
         else:
-            self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+            if self.attention_type != AttentionType.MULTI_HEAD:
+                self.c_attn = Conv1D((self.num_heads + 2) * self.head_dim, self.embed_dim)
+            else:
+                self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
         self.pruned_heads = set()
+        
+        if self.print_details:
+            print('Attention info________________________________________________')
+            print('max_positions ', max_positions)
+            print('self.embed_dim ', self.embed_dim)
+            print('self.num_heads ', self.num_heads)
+            print('self.head_dim ', self.head_dim)
+            print('self.split_size ', self.split_size)
+            print('self.c_attn', self.c_attn)
+            print('______________________________________________________________')
 
     def prune_heads(self, heads):
         if len(heads) == 0:
@@ -186,7 +228,22 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        if self.attention_type == AttentionType.MULTI_QUERY_1:
+            batch_size = query.shape[0]
+            query_length = query.shape[1] // self.num_heads
+            key_length = key.shape[-1]
+            attn_weights = torch.bmm(query, key)
+            if self.print_details:
+                print('query: ', query.shape)
+                print('key: ', key.shape)
+                print('attn_weights: ', attn_weights.shape)
+            attn_weights = attn_weights.view(batch_size, self.num_heads, query_length, key_length)
+        else:
+            attn_weights = torch.matmul(query, key.transpose(-1, -2))
+            if self.print_details:
+                print('query: ', query.shape)
+                print('key.transpose(-1, -2): ', key.transpose(-1, -2).shape)
+                print('attn_weights: ', attn_weights.shape)
 
         if self.scale_attn_weights:
             attn_weights = attn_weights / torch.tensor(
@@ -199,7 +256,13 @@ class GPT2Attention(nn.Module):
 
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
-            query_length, key_length = query.size(-2), key.size(-2)
+            if self.attention_type != AttentionType.MULTI_QUERY_1:
+                query_length, key_length = query.size(-2), key.size(-2)
+            if self.print_details:
+                print('query', query.shape)
+                print('key', key.shape)
+                print('query_length', query_length)
+                print('key_length', key_length)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
@@ -221,7 +284,12 @@ class GPT2Attention(nn.Module):
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
-        attn_output = torch.matmul(attn_weights, value)
+        if self.attention_type == AttentionType.MULTI_QUERY_1:
+            attn_weights = attn_weights.view(batch_size, self.num_heads * query_length, key_length)
+            attn_output = torch.bmm(attn_weights, value)
+            attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
+        else:
+            attn_output = torch.matmul(attn_weights, value)
 
         return attn_output, attn_weights
 
@@ -309,7 +377,13 @@ class GPT2Attention(nn.Module):
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
+        
+        if self.print_details:
+            print('Attention_______________________________________________')
         if encoder_hidden_states is not None:
+            if self.attention_type != AttentionType.MULTI_HEAD:
+                raise NotImplementedError(f'attention_type {self.attention_type}  for encoder_hidden_states')
+
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
@@ -320,15 +394,39 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
-            query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            if self.attention_type != AttentionType.MULTI_HEAD:
+                query, key, value = self.c_attn(hidden_states).split(
+                    (self.num_heads*self.head_dim, self.head_dim, self.head_dim),
+                    dim=2
+                )
+            else:
+                query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
 
-        query = self._split_heads(query, self.num_heads, self.head_dim)
-        key = self._split_heads(key, self.num_heads, self.head_dim)
-        value = self._split_heads(value, self.num_heads, self.head_dim)
+        if self.attention_type == AttentionType.MULTI_QUERY_1:
+            batch_size, seq_length = hidden_states.shape[:2]
+            query = query.view(
+                batch_size, seq_length, self.num_heads, self.head_dim,
+            ).reshape(
+                batch_size, seq_length * self.num_heads, self.head_dim
+            )
+            key = key.permute(0, 2, 1) # [batch_size, head_dim, seq_length]
+            # value [batch_size, seq_length, head_dim]
+        elif self.attention_type == AttentionType.MULTI_QUERY:
+            query = self._split_heads(query, self.num_heads, self.head_dim)
+            key = self._split_heads(key, 1, self.head_dim)
+            value = self._split_heads(value, 1, self.head_dim)
+        else:
+            query = self._split_heads(query, self.num_heads, self.head_dim)
+            key = self._split_heads(key, self.num_heads, self.head_dim)
+            value = self._split_heads(value, self.num_heads, self.head_dim)
 
         if layer_past is not None:
             past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
+            if self.attention_type == AttentionType.MULTI_QUERY_1:
+                key = torch.cat((past_key, key), dim=-1)
+            else:
+                key = torch.cat((past_key, key), dim=-2)
+
             value = torch.cat((past_value, value), dim=-2)
 
         if use_cache is True:
@@ -385,6 +483,11 @@ class GPT2Block(nn.Module):
 
         self.mlp = GPT2MLP(inner_dim, config)
 
+        if hasattr(config, 'print_details') and config.print_details is True:
+            self.print_details = layer_idx == 0
+        else:
+            self.print_details = False
+
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
@@ -398,6 +501,9 @@ class GPT2Block(nn.Module):
     ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
+        if self.print_details:
+            print('hidden_states, ba', hidden_states.size())
+            print('attention_mask, ba', attention_mask.size())
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
@@ -696,6 +802,11 @@ class GPT2Model(GPT2PreTrainedModel):
         self.device_map = None
         self.gradient_checkpointing = False
 
+        if hasattr(config, 'print_details') and config.print_details is True:
+            self.print_details = True
+        else:
+            self.print_details = False
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -775,6 +886,8 @@ class GPT2Model(GPT2PreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if self.print_details:
+            print('-------------startd forward-----------------------------------------')
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
@@ -793,6 +906,9 @@ class GPT2Model(GPT2PreTrainedModel):
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
         if position_ids is not None:
             position_ids = position_ids.view(-1, input_shape[-1])
+        if self.print_details:
+            print('token_type_ids ', token_type_ids is not None)
+            print('position_ids ', position_ids is not None)
 
         if past_key_values is None:
             past_length = 0
@@ -802,18 +918,31 @@ class GPT2Model(GPT2PreTrainedModel):
         if position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+        if self.print_details:
+            print('past_length ', past_length)
+            print('position_ids', position_ids.size(), position_ids)
+            print('past_key_values', len(past_key_values))
 
         # GPT2Attention mask.
+        if self.print_details:
+            print('attention_mask ', attention_mask is not None)
         if attention_mask is not None:
             if batch_size <= 0:
                 raise ValueError("batch_size has to be defined and > 0")
+            if self.print_details:
+                print('attention_mask ', attention_mask.size())
             attention_mask = attention_mask.view(batch_size, -1)
+            if self.print_details:
+                print('attention_mask ', attention_mask.size())
             # We create a 3D attention mask from a 2D tensor mask.
             # Sizes are [batch_size, 1, 1, to_seq_length]
             # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
             # this attention mask is more simple than the triangular masking of causal attention
             # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
             attention_mask = attention_mask[:, None, None, :]
+            if self.print_details:
+                print('attention_mask ', attention_mask.size())
+                print(attention_mask)
 
             # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
             # masked positions, this operation will create a tensor which is 0.0 for
@@ -822,7 +951,12 @@ class GPT2Model(GPT2PreTrainedModel):
             # effectively the same as removing these entirely.
             attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
             attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+            if self.print_details:
+                print(attention_mask)
+                print(torch.finfo(self.dtype).min)
 
+        if self.print_details:
+            print('encoder_hidden_states ', encoder_hidden_states is not None)
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
         if self.config.add_cross_attention and encoder_hidden_states is not None:
@@ -839,11 +973,17 @@ class GPT2Model(GPT2PreTrainedModel):
         # attention_probs has shape bsz x n_heads x N x N
         # head_mask has shape n_layer x batch x n_heads x N x N
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+        if self.print_details:
+            print('head_mask', len(head_mask))
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
+        if self.print_details:
+            print('inputs_embeds', inputs_embeds.size())
+            print('position_embeds', position_embeds.size())
+            print('hidden_states', hidden_states.size())
 
         if token_type_ids is not None:
             token_type_embeds = self.wte(token_type_ids)
@@ -852,7 +992,14 @@ class GPT2Model(GPT2PreTrainedModel):
         hidden_states = self.drop(hidden_states)
 
         output_shape = input_shape + (hidden_states.size(-1),)
+        if self.print_details:
+            print('output_shape ', output_shape)
+            print('input_shape ', input_shape)
+            print('hidden_states.size ', hidden_states.size())
 
+            print('use_cache', use_cache)
+            print('output_attentions', output_attentions)
+            print('output_hidden_states', output_attentions)
         presents = () if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
@@ -898,6 +1045,16 @@ class GPT2Model(GPT2PreTrainedModel):
                     encoder_attention_mask,
                 )
             else:
+                if self.print_details and i == 0:
+                    print('Block .......................................................................')
+                    print('hidden_states', hidden_states.size())
+                    print('attention_mask', attention_mask.size())
+                    print('layer_past', False if layer_past is None else [st.shape for st in layer_past])
+                    print('head_mask[i]', False if head_mask[i] is None else head_mask[i].size())
+                    print('encoder_hidden_states', False if encoder_hidden_states is None else encoder_hidden_states.size())
+                    print('encoder_attention_mask', False if encoder_attention_mask is None else encoder_attention_mask.size())
+                    print('use_cache', use_cache)
+                    print('output_attentions', output_attentions)
                 outputs = block(
                     hidden_states,
                     layer_past=layer_past,
@@ -908,6 +1065,8 @@ class GPT2Model(GPT2PreTrainedModel):
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
+                if self.print_details and i == 0:
+                    print(len(outputs))
 
             hidden_states = outputs[0]
             if use_cache is True:
@@ -937,6 +1096,8 @@ class GPT2Model(GPT2PreTrainedModel):
                 for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
                 if v is not None
             )
+        if self.print_details:
+            print('-------------finish forward-----------------------------------------')
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
