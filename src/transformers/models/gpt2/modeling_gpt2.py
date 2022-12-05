@@ -140,7 +140,7 @@ class GPT2Attention(nn.Module):
         self.register_buffer("masked_bias", torch.tensor(-1e4))
         
         if hasattr(config, 'attention_type'):
-            self.attention_type = config.attention_type
+            self.attention_type = AttentionType(config.attention_type)
         else:
             self.attention_type = AttentionType.MULTI_HEAD
 
