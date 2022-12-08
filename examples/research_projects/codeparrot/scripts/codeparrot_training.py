@@ -119,7 +119,6 @@ def setup_logging(args):
         transformers.utils.logging.set_verbosity_error()
     return logger, run_name
 
-
 def create_dataloaders(args):
     ds_kwargs = {"streaming": args.no_streaming}
     train_data = load_dataset(args.dataset_name_train, split="train", **ds_kwargs)
@@ -141,7 +140,8 @@ def create_dataloaders(args):
         tokenizer, valid_data, infinite=False, seq_length=args.seq_length, tokenized=args.tokenized
     )
     train_dataset = train_dataset.shuffle(buffer_size=args.shuffle_buffer)
-    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True)
+    # ShufflerIterDataPipe does not work in torch 1.13 hence shuffle=False
+    train_dataloader = DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=False)
     eval_dataloader = DataLoader(valid_dataset, batch_size=args.valid_batch_size)
     return train_dataloader, eval_dataloader
 
