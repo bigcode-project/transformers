@@ -20,8 +20,9 @@ class TrainingArguments:
     dataset_name_valid: Optional[str] = field(
         default="codeparrot/codeparrot-clean-valid", metadata={"help": "Name or path of validation dataset."}
     )
-    train_batch_size: Optional[int] = field(default=2, metadata={"help": "Batch size for training."})
-    valid_batch_size: Optional[int] = field(default=2, metadata={"help": "Batch size for evaluation."})
+    train_batch_size: Optional[int] = field(default=320, metadata={"help": "Batch size for training."})
+    train_batch_size_select: Optional[int] = field(default=32, metadata={"help": "Batch size to subselect for training."})
+    valid_batch_size: Optional[int] = field(default=32, metadata={"help": "Batch size for evaluation."})
     weight_decay: Optional[float] = field(default=0.1, metadata={"help": "Value of weight decay."})
     shuffle_buffer: Optional[int] = field(
         default=10000, metadata={"help": "Size of buffer used to shuffle streaming dataset."}
@@ -46,6 +47,18 @@ class TrainingArguments:
     save_checkpoint_steps: Optional[int] = field(
         default=1024,
         metadata={"help": "Interval to save checkpoints. Measured as number of forward passes not training steps."},
+    )
+    selection_method: Optional[str] = field(
+        default=None, metadata={"help": "Selection method to subselect from the batch size. Can be uniform or rholoss"}
+    )
+    irred_losses: Optional[str] = field(
+        default="irred_losses.pt", metadata={"help": "Path to irreducible losses pt file. Must be supplied if selection_method is rholoss"}
+    )
+    compute_irred_losses: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "If True irreducible losses are computed and saved to the path specified by irred_losses."
+        },
     )
     resume_from_checkpoint: Optional[str] = field(
         default=None, metadata={"help": "States path if the training should continue from a checkpoint folder."}

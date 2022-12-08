@@ -263,11 +263,38 @@ model.train()
 completed_steps = 0
 t_start = time.time()
 loss_tracking = 0
+
+if args.compute_irred_losses:
+    irred_losses = torch.zeros(len(train_dataloader) * args.train_batch_size, device="cpu")
+elif args.irred_losses and not args.compute_irred_losses:
+    # Should be of shape len(train_dataloader) * args.train_batch_size
+    irred_losses = torch.load(args.irred_losses, map_location=torch.device("cpu"))
+    assert irred_losses.shape[0] == len(train_dataloader) * args.train_batch_size
+
 for step, batch in enumerate(train_dataloader, start=1):
     if args.resume_from_checkpoint and step < resume_step:
         continue  # we need to skip steps until we reach the resumed step
+    if args.selection_method:
+        if args.selection_method == "uniform":
+            batch = {k: v[:args.train_batch_size_select] for k,v in batch.items()}
+        elif args.selection_method == "rholoss":
+            with torch.no_grad():
+                out = model(batch, labels=batch, use_cache=False).loss
+                losses = accelerator.gather(loss.repeat(args.train_batch_size))
+                cur_irred_losses = irred_losses[step-1:args.train_batch_size*step]
+                assert losses.shape == cur_irred_losses.shape
+                red_losses = losses - cur_irred_losses
+                # Select the top args.train_batch_size_select losses & produce a new batch
+                top_losses, top_indices = torch.topk(red_losses, args.train_batch_size_select)
+                batch = {k: v[top_indices] for k,v in batch.items()}
+    if args.compute_irred_losses:
+        with torch.no_grad():
+            out = model(batch, labels=batch, use_cache=False).loss
+            losses = accelerator.gather(loss.repeat(args.train_batch_size))
+            irred_losses[step-1:args.train_batch_size*step] = losses
+        continue
     loss = model(batch, labels=batch, use_cache=False).loss
-    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size_select)).mean()
     loss_tracking += avg_loss.item() / args.gradient_accumulation_steps
     log_metrics(step, {"samples": step * samples_per_step, "loss_per_step/train": loss.item()})
     loss = loss / args.gradient_accumulation_steps
@@ -312,6 +339,11 @@ for step, batch in enumerate(train_dataloader, start=1):
         model.train()
     if completed_steps >= args.max_train_steps:
         break
+
+# Save irred losses
+if args.compute_irred_losses:
+    torch.save(irred_losses, os.path.join(args.save_dir, args.irred_losses))
+    exit()
 
 # Evaluate and save the last checkpoint
 logger.info("Evaluating and saving model after training")
