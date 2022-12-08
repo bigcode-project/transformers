@@ -121,14 +121,17 @@ def setup_logging(args):
 
 
 def create_dataloaders(args):
-    ds_kwargs = {"streaming": True}
+    ds_kwargs = {"streaming": args.no_streaming}
     train_data = load_dataset(args.dataset_name_train, split="train", **ds_kwargs)
     train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
     if args.dataset_name_train == args.dataset_name_valid:
         # Split the dataset into train and validation
-        train_data, valid_data = train_data.train_test_split(
-            test_size=0.05, shuffle=False, seed=args.seed
-        )
+        if args.no_streaming:
+            train_data = train_data.shuffle()
+            valid_data = train_data.select(range(int(len(train_data) * 0.05)))
+            train_data = train_data.select(range(int(len(train_data) * 0.05), len(train_data)))
+        else:
+            valid_data = train_data.take(5000)
     else:
         valid_data = load_dataset(args.dataset_name_valid, split="train", **ds_kwargs)
     train_dataset = ConstantLengthDataset(
