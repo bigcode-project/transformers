@@ -125,10 +125,10 @@ def create_dataloaders(args):
     train_data = load_dataset(args.dataset_name_train, split="train", **ds_kwargs)
     train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
     if args.dataset_name_train == args.dataset_name_valid:
-        valid_size = int(len(train_data) * 0.05)
-        train_size = len(train_data) - valid_size
-        valid_data = train_data.select(range(valid_size))
-        train_data = train_data.select(range(valid_size, train_size))
+        # Split the dataset into train and validation
+        train_data, valid_data = train_data.train_test_split(
+            test_size=0.05, shuffle=False, seed=args.seed
+        )
     else:
         valid_data = load_dataset(args.dataset_name_valid, split="train", **ds_kwargs)
     train_dataset = ConstantLengthDataset(
