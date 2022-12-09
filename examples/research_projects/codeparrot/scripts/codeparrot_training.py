@@ -121,7 +121,7 @@ def setup_logging(args):
 
 def create_dataloaders(args):
     ds_kwargs = {"streaming": args.no_streaming}
-    train_data = load_dataset(args.dataset_name_train, split="train", **ds_kwargs)
+    train_data = load_dataset(args.dataset_name_train, split="train", use_auth_token=True)
     train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
     if args.dataset_name_train == args.dataset_name_valid:
         # Split the dataset into train and validation
