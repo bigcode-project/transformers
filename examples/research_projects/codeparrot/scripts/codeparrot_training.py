@@ -125,14 +125,14 @@ def create_dataloaders(args):
     train_data = train_data.shuffle(buffer_size=args.shuffle_buffer, seed=args.seed)
     if args.dataset_name_train == args.dataset_name_valid:
         # Split the dataset into train and validation
-        if args.no_streaming:
-            train_data = train_data.shuffle()
-            valid_data = train_data.select(range(int(len(train_data) * 0.05)))
-            train_data = train_data.select(range(int(len(train_data) * 0.05), len(train_data)))
-        else:
-            valid_data = train_data.take(5000)
+        data = train_data.train_test_split(
+            test_size=0.005, shuffle=False, seed=args.seed
+        )
+        train_data = data["train"]
+        valid_data = data["test"]
+        print(f"Size of train set: {len(valid_data)} and validation set {len(train_data)}")
     else:
-        valid_data = load_dataset(args.dataset_name_valid, split="train", **ds_kwargs)
+        valid_data = load_dataset(args.dataset_name_valid, split="train", use_auth_token=True)
     train_dataset = ConstantLengthDataset(
         tokenizer, train_data, infinite=True, seq_length=args.seq_length, tokenized=args.tokenized
     )
