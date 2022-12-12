@@ -18,6 +18,7 @@ from arguments import TrainingArguments
 from huggingface_hub import Repository
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, get_scheduler, set_seed
 
+from utils_roloss import sanity_check_irred_losses, compute_save_control_examples
 
 class ConstantLengthDataset(IterableDataset):
     """
@@ -272,37 +273,103 @@ completed_steps = 0
 t_start = time.time()
 loss_tracking = 0
 
+samples_per_step = args.train_batch_size * accelerator.state.num_processes
+total_samples = args.max_train_steps * samples_per_step
+
 if args.compute_irred_losses:
-    irred_losses = torch.zeros(len(train_dataloader) * args.train_batch_size, device="cpu")
+    irred_losses = torch.zeros(total_samples, device="cpu")
+    compute_save_control_examples(
+        accelerator,
+        train_dataloader,
+        args.train_batch_size,
+        limit_control_examples=600,
+        seq_length=args.seq_length,
+        save_dir="./control_examples",
+    )
+    if accelerator.is_main_process:
+        print(f"Total number of samples: {total_samples}")
+        print("Irreducible loss examples were saved in ./control_examples for future sanity checks on the order")
+
 elif args.irred_losses and not args.compute_irred_losses:
-    # Should be of shape len(train_dataloader) * args.train_batch_size
+    # Should be of shape total_samples
     irred_losses = torch.load(args.irred_losses, map_location=torch.device("cpu"))
-    assert irred_losses.shape[0] == len(train_dataloader) * args.train_batch_size
+    assert irred_losses.shape[0] == total_samples, print(
+        f"shape of irred_losses: {irred_losses.shape[0]}, len of train_dataloader: {total_samples}"
+    )
+
+if args.selection_method and args.selection_method == "rholoss":
+    if accelerator.is_main_process:
+        print("Running sanity checks for irreducible losses")
+    # run sanity checks to verify the order of irreducible losses wrt current batches
+    sanity_check_irred_losses(
+        accelerator,
+        train_dataloader,
+        args.train_batch_size,
+        limit_control_examples=600,
+        seq_length=args.seq_length,
+        save_dir="./control_examples",
+    )
 
 for step, batch in enumerate(train_dataloader, start=1):
-    if args.resume_from_checkpoint and step < resume_step:
-        continue  # we need to skip steps until we reach the resumed step
     if args.selection_method:
+        # select a smaller batch of examples to train on using a selection method
         if args.selection_method == "uniform":
-            batch = {k: v[:args.train_batch_size_select] for k,v in batch.items()}
+            batch = batch[torch.randperm(batch.size(0))[: args.train_batch_size_select]]
         elif args.selection_method == "rholoss":
+            # in this setting global_batch_size = train_batch_size x nb_workers
             with torch.no_grad():
-                out = model(batch, labels=batch, use_cache=False).loss
-                losses = accelerator.gather(loss.repeat(args.train_batch_size))
-                cur_irred_losses = irred_losses[step-1:args.train_batch_size*step]
-                assert losses.shape == cur_irred_losses.shape
-                red_losses = losses - cur_irred_losses
+                # we use reduction="none" in GPT2LMHeadModel loss implementation (install transformers from a fork)
+                loss = model(batch, labels=batch, use_cache=False).loss
+                loss = loss.view(batch.size(0), -1).mean(dim=1)
+                assert loss.shape == torch.Size(
+                    [args.train_batch_size]
+                ), "make sure you are using GPT2LMHeadModel with reduction=none in the loss"
+                # TODO check data at the end that may be duplicated to divide batch equally among all workers
+                losses = accelerator.gather(loss)
+                cur_irred_losses = irred_losses[(step - 1) * samples_per_step : step * samples_per_step]
+                try:
+                    losses.shape == cur_irred_losses.shape
+                except:
+                    print(
+                        f"Size mismatch between training losses {losses.shape} and irreducible losses {cur_irred_losses.shape}"
+                    )
+                red_losses = losses - cur_irred_losses.to(losses.device)
+                print(f"shape red_losses {red_losses.shape} and max is {torch.max(red_losses[0])}")
                 # Select the top args.train_batch_size_select losses & produce a new batch
                 top_losses, top_indices = torch.topk(red_losses, args.train_batch_size_select)
-                batch = {k: v[top_indices] for k,v in batch.items()}
+                batches = accelerator.gather(batch)
+                batch = torch.index_select(batches, 0, top_indices)
+                # assert first element has the highest loss
+                assert torch.eq(top_losses[0], torch.max(red_losses)), "first element should have the highest loss"
+                print(f"new size of batch is {batch.shape}")
+
     if args.compute_irred_losses:
+        # compute irreducible losses over the entire dataset and exit
         with torch.no_grad():
-            out = model(batch, labels=batch, use_cache=False).loss
-            losses = accelerator.gather(loss.repeat(args.train_batch_size))
-            irred_losses[step-1:args.train_batch_size*step] = losses
+            # we use reduction="none" in GPT2LMHeadModel loss implementation
+            loss = model(batch, labels=batch, use_cache=False).loss
+            loss = loss.view(batch.size(0), -1).mean(dim=1)
+            assert loss.shape == torch.Size(
+                [args.train_batch_size]
+            ), "make sure you are using GPT2LMHeadModel with reduction=none in the loss"
+            losses = accelerator.gather(loss)
+            try:
+                irred_losses[(step - 1) * samples_per_step : step * samples_per_step] = losses
+            except:
+                print(
+                    f"Size mismatch, step {step} between current losses {losses.shape} and irreducible losses \
+                {irred_losses[(step-1) * samples_per_step: step * samples_per_step].shape}"
+                )
+                break
+        if step >= args.max_train_steps:
+            break
         continue
-    loss = model(batch, labels=batch, use_cache=False).loss
-    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size_select)).mean()
+
+    # model training
+    # TODO! 32 batch doesn't fit => split batch and add "proper" grad accumulation
+    # we are using reduction="none" in GPT2LMHeadModel loss => we add .mean()
+    avg_loss = model(batch, labels=batch, use_cache=False).loss.mean()
+    # no need to do accelerate gather we would just be repeating the loss (workers have the same batch)
     loss_tracking += avg_loss.item() / args.gradient_accumulation_steps
     log_metrics(step, {"samples": step * samples_per_step, "loss_per_step/train": loss.item()})
     loss = loss / args.gradient_accumulation_steps
@@ -321,7 +388,7 @@ for step, batch in enumerate(train_dataloader, start=1):
         lr_scheduler.step()
         optimizer.zero_grad()
         elapsed_time = time.time() - t_start
-        tflops = compute_tflops(elapsed_time, accelerator, args)
+        tflops = compute_tflops(model, tokenizer, elapsed_time, accelerator, args)
         log_metrics(
             step,
             {
@@ -342,15 +409,15 @@ for step, batch in enumerate(train_dataloader, start=1):
         accelerator.wait_for_everyone()
         save_dir = os.path.join(args.save_dir, f"step_{step}")
         accelerator.save_state(save_dir)
-        if accelerator.is_main_process:
-            hf_repo.push_to_hub(commit_message=f"step {step}")
         model.train()
     if completed_steps >= args.max_train_steps:
         break
 
 # Save irred losses
 if args.compute_irred_losses:
-    torch.save(irred_losses, os.path.join(args.save_dir, args.irred_losses))
+    if accelerator.is_main_process:
+        print(f"saving irred losses with shape: {irred_losses.shape}")
+        torch.save(irred_losses, "irred_losses.pt")
     exit()
 
 # Evaluate and save the last checkpoint
