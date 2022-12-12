@@ -3,9 +3,7 @@ import os
 import torch
 
 
-def get_control_examples(
-    accelerator, dataloader, train_batch_size, limit_control_examples=600, seq_length=1024
-):
+def get_control_examples(accelerator, dataloader, train_batch_size, limit_control_examples=600, seq_length=1024):
     """get control examples for computing the irreducible losses over the entire dataset"""
     control_examples = torch.zeros((limit_control_examples, seq_length), device="cpu").type(torch.LongTensor)
     for step, batch in enumerate(dataloader, start=1):
@@ -33,7 +31,7 @@ def compute_save_control_examples(
 ):
     """compute and save control examples for computing the irreducible losses over the entire dataset"""
     control_examples = get_control_examples(
-         accelerator, dataloader, train_batch_size, limit_control_examples, seq_length
+        accelerator, dataloader, train_batch_size, limit_control_examples, seq_length
     )
     if accelerator.is_main_process:
         # save each losses and examples
