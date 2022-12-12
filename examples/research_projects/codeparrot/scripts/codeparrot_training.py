@@ -213,9 +213,15 @@ for step, batch in enumerate(train_dataloader, start=1):
         elif args.selection_method == "rholoss":
             # in this setting global_batch_size = train_batch_size x nb_workers
             with torch.no_grad():
-                # we use reduction="none" in GPT2LMHeadModel loss implementation (install transformers from a fork)
-                loss = model(batch, labels=batch, use_cache=False).loss
-                loss = loss.view(batch.size(0), -1).mean(dim=1)
+                losses = []
+                # To avoid running OOM, compute the loss on a smaller batches 
+                sub_batches = torch.split(batch, args.gradient_accumulation_steps)
+                for sub_batch in sub_batches:
+                    # we use reduction="none" in GPT2LMHeadModel loss implementation (install transformers from a fork)
+                    loss = model(sub_batch, labels=sub_batch, use_cache=False).loss
+                    loss = loss.view(sub_batch.size(0), -1).mean(dim=1)
+                    losses.append(loss)
+                losses = torch.cat(losses, dim=0)
                 assert loss.shape == torch.Size(
                     [args.train_batch_size]
                 ), "make sure you are using GPT2LMHeadModel with reduction=none in the loss"
