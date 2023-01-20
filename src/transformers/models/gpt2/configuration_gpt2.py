@@ -34,6 +34,13 @@ GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "distilgpt2": "https://huggingface.co/distilgpt2/resolve/main/config.json",
 }
 
+from enum import Enum
+class AttentionType(Enum):
+    MULTI_HEAD = 1
+    MULTI_QUERY = 2
+    MULTI_QUERY_1 = 3
+    MULTI_QUERY_2 = 4
+
 
 class GPT2Config(PretrainedConfig):
     """
@@ -163,6 +170,7 @@ class GPT2Config(PretrainedConfig):
         eos_token_id=50256,
         scale_attn_by_inverse_layer_idx=False,
         reorder_and_upcast_attn=False,
+        attention_type=AttentionType.MULTI_HEAD,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -189,6 +197,14 @@ class GPT2Config(PretrainedConfig):
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+
+        self.attention_type = attention_type
+        assert (
+            self.attention_type == AttentionType.MULTI_HEAD or
+            self.attention_type == AttentionType.MULTI_QUERY or
+            self.attention_type == AttentionType.MULTI_QUERY_1 or
+            self.attention_type == AttentionType.MULTI_QUERY_2
+        )
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 

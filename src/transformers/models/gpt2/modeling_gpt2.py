@@ -44,14 +44,7 @@ from ...utils import (
     replace_return_docstrings,
 )
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
-from .configuration_gpt2 import GPT2Config
-
-from enum import Enum
-class AttentionType(Enum):
-    MULTI_HEAD = 1
-    MULTI_QUERY = 2
-    MULTI_QUERY_1 = 3
-
+from .configuration_gpt2 import GPT2Config, AttentionType
 
 logger = logging.get_logger(__name__)
 
@@ -139,16 +132,7 @@ class GPT2Attention(nn.Module):
         )
         self.register_buffer("masked_bias", torch.tensor(-1e4))
         
-        if hasattr(config, 'attention_type'):
-            self.attention_type = AttentionType(config.attention_type)
-        else:
-            self.attention_type = AttentionType.MULTI_HEAD
-
-        assert (
-            self.attention_type == AttentionType.MULTI_HEAD or
-            self.attention_type == AttentionType.MULTI_QUERY or
-            self.attention_type == AttentionType.MULTI_QUERY_1
-        )
+        self.attention_type = config.attention_type
 
         if hasattr(config, 'print_details') and config.print_details is True:
             self.print_details = layer_idx == 0
@@ -185,6 +169,10 @@ class GPT2Attention(nn.Module):
         else:
             if self.attention_type != AttentionType.MULTI_HEAD:
                 self.c_attn = Conv1D((self.num_heads + 2) * self.head_dim, self.embed_dim)
+            elif self.attention_type != AttentionType.MULTI_QUERY_2:
+                self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+                # Keys and values are shared across heads
+                self.kv_attn = Conv1D(2 * self.head_dim, self.embed_dim)
             else:
                 self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
 
@@ -221,11 +209,22 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        if self.attention_type == AttentionType.MULTI_QUERY_1:
+        if (self.attention_type == AttentionType.MULTI_QUERY_1 or
+            self.attention_type == AttentionType.MULTI_QUERY_2):
+            # query: (b, num_heads * sq, head_dim)
+            # key: (b, head_dim, sk)
+            # value: (b, sk, head_dim)
+            # NOTE: which one is more canonical?
             batch_size = query.shape[0]
             query_length = query.shape[1] // self.num_heads
             key_length = key.shape[-1]
+            #batch_size = query.size(0)
+            #query_length = query.size(1) // self.num_heads
+            #key_length = key.size(2)
+            
+            # (b, num_heads * sq, head_dim) x (b, head_dim, sk) -> (b, num_heads * sq, sk)
             attn_weights = torch.bmm(query, key)
+            # -> (b, num_heads, sq, sk)
             if self.print_details:
                 print('query: ', query.shape)
                 print('key: ', key.shape)
@@ -239,9 +238,13 @@ class GPT2Attention(nn.Module):
                 print('attn_weights: ', attn_weights.shape)
 
         if self.scale_attn_weights:
+            # NOTE: which is faster?
             attn_weights = attn_weights / torch.full(
                 [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
             )
+            # attn_weights = attn_weights / torch.tensor(
+            #    value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
+            #)
 
         # Layer-wise attention scaling
         if self.scale_attn_by_inverse_layer_idx:
@@ -260,7 +263,9 @@ class GPT2Attention(nn.Module):
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+            # NOTE: which is faster?
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+            #mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights, mask_value)
 
         if attention_mask is not None:
@@ -278,8 +283,15 @@ class GPT2Attention(nn.Module):
             attn_weights = attn_weights * head_mask
 
         if self.attention_type == AttentionType.MULTI_QUERY_1:
+            # NOTE: is here ouptud dim order of attn_weights is messed up
             attn_weights = attn_weights.view(batch_size, self.num_heads * query_length, key_length)
             attn_output = torch.bmm(attn_weights, value)
+            attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
+        elif self.attention_type == AttentionType.MULTI_QUERY_2:
+            # (b, num_heads, sq, sk) -> (b, num_heads * sq, sk)
+            _attn_weights = attn_weights.view(batch_size, self.num_heads * query_length, key_length)
+            # (b, num_heads * sq, sk) x (b, sk, head_dim) -> (b, num_heads * sq, head_dim)
+            attn_output = torch.bmm(_attn_weights, value)
             attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
         else:
             attn_output = torch.matmul(attn_weights, value)
@@ -382,15 +394,37 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
-            if self.attention_type != AttentionType.MULTI_HEAD:
+            if self.attention_type == AttentionType.MULTI_HEAD:
+                query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+            elif self.attention_type == AttentionType.MULTI_QUERY_2:
+                query = self.q_attn(hidden_states)
+                key, value = self.kv_attn(hidden_states).split(self.head_dim, dim=2)
+            else:
                 query, key, value = self.c_attn(hidden_states).split(
                     (self.num_heads*self.head_dim, self.head_dim, self.head_dim),
                     dim=2
                 )
-            else:
-                query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+                
 
-        if self.attention_type == AttentionType.MULTI_QUERY_1:
+        if self.attention_type == AttentionType.MULTI_QUERY_2:
+            batch_size, seq_length = query.shape[:2]
+            # (query_length, batch, num_heads, head_dim)
+            # (batch, num_heads * query_length, head_dim)\
+
+            # (batch, query_length, hidden_size) -> (batch, num_heads, query_length, head_dim)
+            query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).permute([0, 2, 1, 3])
+            # -> (batch, num_heads * query_length, head_dim)
+            query = query.reshape(batch_size, self.num_heads * seq_length, self.head_dim)
+
+            # (batch, query_length, hidden_size) -> (batch, query_length * num_heads, head_dim)
+            # query = query.view(
+            #     batch_size, seq_length, self.num_heads, self.head_dim,
+            # ).reshape(
+            #     batch_size, seq_length * self.num_heads, self.head_dim
+            # )
+            key = key.permute(0, 2, 1)  # (batch_size, head_dim, seq_length)
+            # value (batch_size, seq_length, head_dim
+        elif self.attention_type == AttentionType.MULTI_QUERY_1:
             batch_size, seq_length = hidden_states.shape[:2]
             query = query.view(
                 batch_size, seq_length, self.num_heads, self.head_dim,
@@ -410,7 +444,9 @@ class GPT2Attention(nn.Module):
 
         if layer_past is not None:
             past_key, past_value = layer_past
-            if self.attention_type == AttentionType.MULTI_QUERY_1:
+            # Concatenate on sequence dimension
+            if (self.attention_type == AttentionType.MULTI_QUERY_1 or
+                self.attention_type == AttentionType.MULTI_QUERY_2):
                 key = torch.cat((past_key, key), dim=-1)
             else:
                 key = torch.cat((past_key, key), dim=-2)
@@ -423,6 +459,8 @@ class GPT2Attention(nn.Module):
             present = None
 
         if self.reorder_and_upcast_attn:
+            # NOTE: exception is raised in __init__ if not multi head attention
+            #raise NotImplementedError("Reorder and upcast attention not implemented for MQA")
             attn_output, attn_weights = self._upcast_and_reordered_attn(query, key, value, attention_mask, head_mask)
         else:
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
@@ -466,6 +504,8 @@ class GPT2Block(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
+            if config.attention_type != AttentionType.MULTI_HEAD:
+                raise NotImplementedError("Cross-attention not implemented for MQA")
             self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
