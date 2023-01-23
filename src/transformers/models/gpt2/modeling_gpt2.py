@@ -163,14 +163,13 @@ class GPT2Attention(nn.Module):
             self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
             self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
         else:
-            if self.attention_type != AttentionType.MULTI_HEAD:
-                self.c_attn = Conv1D((self.num_heads + 2) * self.head_dim, self.embed_dim)
-            elif self.attention_type != AttentionType.MULTI_QUERY_2:
+            if self.attention_type == AttentionType.MULTI_QUERY_2:
                 self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
                 # Keys and values are shared across heads
                 self.kv_attn = Conv1D(2 * self.head_dim, self.embed_dim)
             else:
-                self.c_attn = Conv1D(3 * self.embed_dim, self.embed_dim)
+                k_dim=self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
+                self.c_attn = Conv1D(self.embed_dim+2*k_dim, self.embed_dim)
 
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
