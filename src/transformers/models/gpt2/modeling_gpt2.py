@@ -194,20 +194,15 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        batch_size = query.size(0)
-        if self.attention_type == AttentionType.MULTI_QUERY_1 or self.attention_type == AttentionType.MULTI_QUERY_2:
-            # query: (b, num_heads * sq, head_dim)
-            # key: (b, head_dim, sk)
-            # value: (b, sk, head_dim)
-            query_length = query.size(1) // self.num_heads
-            key_length = key.size(2)
+        # query: (b, nh, sq, hs)
+        # key: (b, kv_nh, sk, hs)
+        # value: (b, kv_nh, sk, hs)
 
-            # (b, num_heads * sq, head_dim) x (b, head_dim, sk) -> (b, num_heads * sq, sk)
-            attn_weights = torch.bmm(query, key)
-            # -> (b, num_heads, sq, sk)
-            attn_weights = attn_weights.view(batch_size, self.num_heads, query_length, key_length)
-        else:
-            attn_weights = torch.matmul(query, key.transpose(-1, -2))
+        query_length = query.size(2)
+        key_length = key.size(2)
+
+        # (b, nh, sq, hs) x (b, kv_nh, hs, sk) -> (b, nh, sq, sk)
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
         if self.scale_attn_weights:
             attn_weights = attn_weights / value.size(-1) ** 0.5
@@ -218,8 +213,6 @@ class GPT2Attention(nn.Module):
 
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
-            if self.attention_type != AttentionType.MULTI_QUERY_1:
-                query_length, key_length = query.size(-2), key.size(-2)
             causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
@@ -241,17 +234,7 @@ class GPT2Attention(nn.Module):
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
-        if self.attention_type == AttentionType.MULTI_QUERY_1 or self.attention_type == AttentionType.MULTI_QUERY_2:
-            # (b, num_heads, sq, sk) -> (b, num_heads * sq, sk)
-            _attn_weights = attn_weights.view(batch_size, self.num_heads * query_length, key_length)
-            # (b, num_heads * sq, sk) x (b, sk, head_dim) -> (b, num_heads * sq, head_dim)
-            attn_output = torch.bmm(_attn_weights, value)
-            attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
-            if self.attention_type == AttentionType.MULTI_QUERY_1:
-                # TODO: Why?
-                attn_weights=_attn_weights
-        else:
-            attn_output = torch.matmul(attn_weights, value)
+        attn_output = torch.matmul(attn_weights, value)
 
         return attn_output, attn_weights
 
@@ -345,26 +328,25 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
+            # hidden_states: (b, sq, embed)
             if self.attention_type == AttentionType.MULTI_QUERY_2:
+                # (b, sq, embed) x (embed, nh*hs) -> (b, sq,  nh*hs)
                 query = self.q_attn(hidden_states)
+                # (b, sq, embed) x (embed, 2*kv) -> (b, sq, 2*kv) -> (b, sq, kv) + (b, sq, kv)
                 key, value = self.kv_attn(hidden_states).split((self.kv_dim, self.kv_dim), dim=2)
             else:
+                # (b, sq, embed) x (embed, nh*hs + 2*kv) -> (b, sq,  nh*hs + 2*kv) -> (b, sq,  nh*hs) + (b, sq, kv) + (b, sq, kv)
                 query, key, value = self.c_attn(hidden_states).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=2)
+            # query: (b, sq,  nh*hs)
+            # key: (b, sk, kv), sk == sq
+            # value: (b, sk, kv)
 
-        if self.attention_type == AttentionType.MULTI_QUERY_1 or self.attention_type == AttentionType.MULTI_QUERY_2:
-            batch_size, seq_length = query.shape[:2]
-
-            query = query.view(batch_size, seq_length, self.num_heads, self.head_dim)
-            if self.attention_type == AttentionType.MULTI_QUERY_2:
-                query = query.permute([0, 2, 1, 3])
-            query = query.reshape(batch_size, seq_length * self.num_heads, self.head_dim)
-
-            key = key.permute(0, 2, 1)  # [batch_size, head_dim, seq_length]
-            # value [batch_size, seq_length, head_dim]
-        else:
-            query = self._split_heads(query, self.num_heads, self.head_dim)
-            key = self._split_heads(key, self.num_kv_heads, self.head_dim)
-            value = self._split_heads(value, self.num_kv_heads, self.head_dim)
+        query = self._split_heads(query, self.num_heads, self.head_dim)
+        key = self._split_heads(key, self.num_kv_heads, self.head_dim)
+        value = self._split_heads(value, self.num_kv_heads, self.head_dim)
+        # query: (b, nh, sq, hs)
+        # key: (b, kv_nh, sk, hs)
+        # value: (b, kv_nh, sk, hs)
 
         if layer_past is not None:
             past_key, past_value = layer_past
