@@ -238,13 +238,7 @@ class GPT2Attention(nn.Module):
                 print('attn_weights: ', attn_weights.shape)
 
         if self.scale_attn_weights:
-            # NOTE: which is faster?
-            attn_weights = attn_weights / torch.full(
-                [], value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
-            )
-            # attn_weights = attn_weights / torch.tensor(
-            #    value.size(-1) ** 0.5, dtype=attn_weights.dtype, device=attn_weights.device
-            #)
+            attn_weights = attn_weights / value.size(-1) ** 0.5
 
         # Layer-wise attention scaling
         if self.scale_attn_by_inverse_layer_idx:
@@ -263,9 +257,7 @@ class GPT2Attention(nn.Module):
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
             # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            # NOTE: which is faster?
             mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-            #mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
             attn_weights = torch.where(causal_mask, attn_weights, mask_value)
 
         if attention_mask is not None:
