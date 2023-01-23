@@ -136,10 +136,10 @@ class GPT2Attention(nn.Module):
         self.attention_type = AttentionType(config.attention_type)
 
         self.embed_dim = config.hidden_size
+        self.kv_dim=self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
         self.split_size = self.embed_dim
-
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
                 f"`embed_dim` must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
@@ -166,10 +166,9 @@ class GPT2Attention(nn.Module):
             if self.attention_type == AttentionType.MULTI_QUERY_2:
                 self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
                 # Keys and values are shared across heads
-                self.kv_attn = Conv1D(2 * self.head_dim, self.embed_dim)
+                self.kv_attn = Conv1D(2 * self.kv_dim, self.embed_dim)
             else:
-                k_dim=self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
-                self.c_attn = Conv1D(self.embed_dim+2*k_dim, self.embed_dim)
+                self.c_attn = Conv1D(self.embed_dim+2*self.kv_dim, self.embed_dim)
 
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
@@ -340,12 +339,8 @@ class GPT2Attention(nn.Module):
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
-
         if encoder_hidden_states is not None:
-            if self.attention_type != AttentionType.MULTI_HEAD:
-                raise NotImplementedError(f"attention_type {self.attention_type}  for encoder_hidden_states")
-
-            if not hasattr(self, "q_attn"):
+            if not hasattr(self, "q_attn") or not self.is_cross_attention:
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
                     "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
@@ -355,15 +350,11 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
-            if self.attention_type == AttentionType.MULTI_HEAD:
-                query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
-            elif self.attention_type == AttentionType.MULTI_QUERY_2:
+            if self.attention_type == AttentionType.MULTI_QUERY_2:
                 query = self.q_attn(hidden_states)
                 key, value = self.kv_attn(hidden_states).split(self.head_dim, dim=2)
             else:
-                query, key, value = self.c_attn(hidden_states).split(
-                    (self.num_heads * self.head_dim, self.head_dim, self.head_dim), dim=2
-                )
+                query, key, value = self.c_attn(hidden_states).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=2)
 
         if self.attention_type == AttentionType.MULTI_QUERY_2:
             batch_size, seq_length = query.shape[:2]
