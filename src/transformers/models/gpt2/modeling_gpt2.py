@@ -138,6 +138,7 @@ class GPT2Attention(nn.Module):
         self.embed_dim = config.hidden_size
         self.kv_dim=self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
         self.num_heads = config.num_attention_heads
+        self.num_kv_heads=self.num_heads if self.attention_type == AttentionType.MULTI_HEAD else 1
         self.head_dim = self.embed_dim // self.num_heads
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
@@ -193,17 +194,13 @@ class GPT2Attention(nn.Module):
         self.pruned_heads = self.pruned_heads.union(heads)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+        batch_size = query.size(0)
         if self.attention_type == AttentionType.MULTI_QUERY_1 or self.attention_type == AttentionType.MULTI_QUERY_2:
             # query: (b, num_heads * sq, head_dim)
             # key: (b, head_dim, sk)
             # value: (b, sk, head_dim)
-            # NOTE: which one is more canonical?
-            batch_size = query.shape[0]
-            query_length = query.shape[1] // self.num_heads
-            key_length = key.shape[-1]
-            # batch_size = query.size(0)
-            # query_length = query.size(1) // self.num_heads
-            # key_length = key.size(2)
+            query_length = query.size(1) // self.num_heads
+            key_length = key.size(2)
 
             # (b, num_heads * sq, head_dim) x (b, head_dim, sk) -> (b, num_heads * sq, sk)
             attn_weights = torch.bmm(query, key)
@@ -244,17 +241,15 @@ class GPT2Attention(nn.Module):
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
-        if self.attention_type == AttentionType.MULTI_QUERY_1:
-            # NOTE: is here ouptud dim order of attn_weights is messed up
-            attn_weights = attn_weights.view(batch_size, self.num_heads * query_length, key_length)
-            attn_output = torch.bmm(attn_weights, value)
-            attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
-        elif self.attention_type == AttentionType.MULTI_QUERY_2:
+        if self.attention_type == AttentionType.MULTI_QUERY_1 or self.attention_type == AttentionType.MULTI_QUERY_2:
             # (b, num_heads, sq, sk) -> (b, num_heads * sq, sk)
             _attn_weights = attn_weights.view(batch_size, self.num_heads * query_length, key_length)
             # (b, num_heads * sq, sk) x (b, sk, head_dim) -> (b, num_heads * sq, head_dim)
             attn_output = torch.bmm(_attn_weights, value)
             attn_output = attn_output.view(batch_size, self.num_heads, query_length, self.head_dim)
+            if self.attention_type == AttentionType.MULTI_QUERY_1:
+                # TODO: Why?
+                attn_weights=_attn_weights
         else:
             attn_output = torch.matmul(attn_weights, value)
 
@@ -352,46 +347,24 @@ class GPT2Attention(nn.Module):
         else:
             if self.attention_type == AttentionType.MULTI_QUERY_2:
                 query = self.q_attn(hidden_states)
-                key, value = self.kv_attn(hidden_states).split(self.head_dim, dim=2)
+                key, value = self.kv_attn(hidden_states).split((self.kv_dim, self.kv_dim), dim=2)
             else:
                 query, key, value = self.c_attn(hidden_states).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=2)
 
-        if self.attention_type == AttentionType.MULTI_QUERY_2:
+        if self.attention_type == AttentionType.MULTI_QUERY_1 or self.attention_type == AttentionType.MULTI_QUERY_2:
             batch_size, seq_length = query.shape[:2]
-            # (query_length, batch, num_heads, head_dim)
-            # (batch, num_heads * query_length, head_dim)\
 
-            # (batch, query_length, hidden_size) -> (batch, num_heads, query_length, head_dim)
-            query = query.view(batch_size, seq_length, self.num_heads, self.head_dim).permute([0, 2, 1, 3])
-            # -> (batch, num_heads * query_length, head_dim)
-            query = query.reshape(batch_size, self.num_heads * seq_length, self.head_dim)
+            query = query.view(batch_size, seq_length, self.num_heads, self.head_dim)
+            if self.attention_type == AttentionType.MULTI_QUERY_2:
+                query = query.permute([0, 2, 1, 3])
+            query = query.reshape(batch_size, seq_length * self.num_heads, self.head_dim)
 
-            # (batch, query_length, hidden_size) -> (batch, query_length * num_heads, head_dim)
-            # query = query.view(
-            #     batch_size, seq_length, self.num_heads, self.head_dim,
-            # ).reshape(
-            #     batch_size, seq_length * self.num_heads, self.head_dim
-            # )
-            key = key.permute(0, 2, 1)  # (batch_size, head_dim, seq_length)
-            # value (batch_size, seq_length, head_dim
-        elif self.attention_type == AttentionType.MULTI_QUERY_1:
-            batch_size, seq_length = hidden_states.shape[:2]
-            query = query.view(
-                batch_size,
-                seq_length,
-                self.num_heads,
-                self.head_dim,
-            ).reshape(batch_size, seq_length * self.num_heads, self.head_dim)
             key = key.permute(0, 2, 1)  # [batch_size, head_dim, seq_length]
             # value [batch_size, seq_length, head_dim]
-        elif self.attention_type == AttentionType.MULTI_QUERY:
-            query = self._split_heads(query, self.num_heads, self.head_dim)
-            key = self._split_heads(key, 1, self.head_dim)
-            value = self._split_heads(value, 1, self.head_dim)
         else:
             query = self._split_heads(query, self.num_heads, self.head_dim)
-            key = self._split_heads(key, self.num_heads, self.head_dim)
-            value = self._split_heads(value, self.num_heads, self.head_dim)
+            key = self._split_heads(key, self.num_kv_heads, self.head_dim)
+            value = self._split_heads(value, self.num_kv_heads, self.head_dim)
 
         if layer_past is not None:
             past_key, past_value = layer_past
