@@ -38,9 +38,8 @@ GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP = {
 
 class AttentionType(Enum):
     MULTI_HEAD = 1
-    MULTI_QUERY = 2
-    MULTI_QUERY_1 = 3
-    MULTI_QUERY_2 = 4
+    MULTI_QUERY_1 = 2
+    MULTI_QUERY_2 = 3
 
 
 class GPT2Config(PretrainedConfig):

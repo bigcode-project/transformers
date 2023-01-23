@@ -322,37 +322,19 @@ class GPT2Attention(nn.Module):
             key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
-            # hidden_states: (b, sq, embed)
             if self.attention_type == AttentionType.MULTI_QUERY_2:
-                # (b, sq, embed) x (embed, nh*hs) -> (b, sq,  nh*hs)
                 query = self.q_attn(hidden_states)
-                # (b, sq, embed) x (embed, 2*kv) -> (b, sq, 2*kv) -> (b, sq, kv) + (b, sq, kv)
                 key, value = self.kv_attn(hidden_states).split((self.kv_dim, self.kv_dim), dim=2)
             else:
-                # (b, sq, embed) x (embed, nh*hs + 2*kv) -> (b, sq,  nh*hs + 2*kv) -> (b, sq,  nh*hs) + (b, sq, kv) + (b, sq, kv)
                 query, key, value = self.c_attn(hidden_states).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=2)
-            # query: (b, sq,  nh*hs)
-            # key: (b, sk, kv), sk == sq
-            # value: (b, sk, kv)
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_kv_heads, self.head_dim)
         value = self._split_heads(value, self.num_kv_heads, self.head_dim)
-        # query: (b, nh, sq, hs)
-        # key: (b, kv_nh, sk, hs)
-        # value: (b, kv_nh, sk, hs)
 
         if layer_past is not None:
             past_key, past_value = layer_past
-            # Concatenate on sequence dimension
-            if (
-                self.attention_type == AttentionType.MULTI_QUERY_1
-                or self.attention_type == AttentionType.MULTI_QUERY_2
-            ):
-                key = torch.cat((past_key, key), dim=-1)
-            else:
-                key = torch.cat((past_key, key), dim=-2)
-
+            key = torch.cat((past_key, key), dim=-2)
             value = torch.cat((past_value, value), dim=-2)
 
         if use_cache is True:
