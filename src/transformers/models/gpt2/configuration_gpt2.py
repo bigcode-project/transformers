@@ -15,6 +15,7 @@
 # limitations under the License.
 """ OpenAI GPT-2 configuration"""
 from collections import OrderedDict
+from enum import Enum
 from typing import Any, List, Mapping, Optional
 
 from transformers import PreTrainedTokenizer, TensorType, is_torch_available
@@ -34,7 +35,7 @@ GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "distilgpt2": "https://huggingface.co/distilgpt2/resolve/main/config.json",
 }
 
-from enum import Enum
+
 class AttentionType(Enum):
     MULTI_HEAD = 1
     MULTI_QUERY = 2
@@ -198,13 +199,8 @@ class GPT2Config(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        self.attention_type = attention_type
-        assert (
-            self.attention_type == AttentionType.MULTI_HEAD or
-            self.attention_type == AttentionType.MULTI_QUERY or
-            self.attention_type == AttentionType.MULTI_QUERY_1 or
-            self.attention_type == AttentionType.MULTI_QUERY_2
-        )
+        # Convert to an int so it's JSON-serializable.
+        self.attention_type = int(AttentionType(attention_type))
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
