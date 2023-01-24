@@ -199,7 +199,7 @@ class GPT2Config(PretrainedConfig):
         self.eos_token_id = eos_token_id
 
         # Convert to an int so it's JSON-serializable.
-        self.attention_type = int(AttentionType(attention_type))
+        self.attention_type = AttentionType(attention_type).value
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
