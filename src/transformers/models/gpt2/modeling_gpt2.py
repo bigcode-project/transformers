@@ -191,42 +191,25 @@ class GPT2Attention(nn.Module):
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def _matmul(self, x, y):
+    def _matmul(self, x, y, dtype=None, scale_factor=1.0):
+        output_shape = (*x.size()[:-1], y.size(-1))
         if self.is_mqa:
             # Q x K: (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
             # A X V: (b, sq, nh, sk) x (b, sk, hs) -> (b, sq, nh, hs)
-            return torch.matmul(x.view(x.size(0), -1, x.size(-1)), y).view(*x.shape[:-1], y.shape[-1])
+            output_view = (x.size(0), x.size(1) * x.size(2), y.size(-1))
+            x=x.view(*output_view[:-1], x.size(-1))
         else:
             # Q x K: (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
             # A X V: (b, nh, sq, sk) x (b, nh, sk, hs) -> (b, nh, sq, hs)
-            return torch.matmul(x, y)
-
-    def _matmul_scaled(self, x, y, dtype, scale_factor=1.0):
-        if scale_factor == 1.0:
-            return self._matmul(x, y)
-        output_shape = (*x.shape[:-1], y.size(-1))
-        if self.is_mqa:
-            # Q x K: (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
-            output_view = (x.size(0), x.size(1) * x.size(2), y.size(-1))
-            z = torch.empty(output_view, dtype=dtype, device=x.device)
-            z = torch.baddbmm(
-                z,
-                x.view(*output_view[:-1], x.size(-1)),
-                y,
-                beta=0,
-                alpha=scale_factor,
-            )
-        else:
-            # Q x K: (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
             output_view = (x.size(0) * x.size(1), x.size(2), y.size(-1))
-            z = torch.empty(output_view, dtype=dtype, device=x.device)
-            z = torch.baddbmm(
-                z,
-                x.view(output_view[0], *x.shape[2:]),
-                y.view(output_view[0], *y.shape[2:]),
-                beta=0,
-                alpha=scale_factor,
-            )
+            x=x.view(output_view[0], *x.size()[2:])
+            y=y.view(output_view[0], *y.size()[2:])
+        if scale_factor == 1.0 and dtype is None:
+            # TODO: Is baddbmm identical?
+            z=torch.matmul(x, y)
+        else:
+            z = torch.empty(output_view, dtype=x.dtype if dtype is None else dtype, device=x.device)
+            z = torch.baddbmm(z,x,y,beta=0,alpha=scale_factor)
         return z.view(output_shape)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None, upcast=False):
@@ -238,18 +221,20 @@ class GPT2Attention(nn.Module):
             scale_factor /= self.layer_idx + 1
 
         with autocast(enabled=False):
-            attn_weights = self._matmul_scaled(
-                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else query.dtype, scale_factor=scale_factor
+            attn_weights = self._matmul(
+                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else None, scale_factor=scale_factor
             )
 
         if not self.is_cross_attention:
             # if only "normal" attention layer implements causal mask
-            query_length, key_length = query.size(-2), key.size(-2)
+            key_length = key.size(-2)
             if self.is_mqa:
                 # (b, sq, nh, sk)
+                query_length = query.size(1)
                 causal_mask = self.bias[:, key_length - query_length : key_length, :, :key_length].to(torch.bool)
             else:
                 # (b, nh, sq, sk)
+                query_length = query.size(-2)
                 causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
             mask_value = torch.finfo(attn_weights.dtype).min
             # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
