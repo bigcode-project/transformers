@@ -123,15 +123,14 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
-
         max_positions = config.max_position_embeddings
         self.register_buffer(
-            "bias",
-            torch.tril(torch.ones((max_positions, max_positions), dtype=torch.uint8)).view(
-                1, 1, max_positions, max_positions
-            ),
+            "bias", torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)), persistent=False
         )
-        self.register_buffer("masked_bias", torch.tensor(-1e4))
+        self.register_buffer("masked_bias", torch.tensor(-1e4), persistent=False)
+        # We don't use a buffer because the mask value depends on the dtype,
+        # And the dtype will be different if upcasting.
+        self.mask_value = None
 
         self.attention_type = AttentionType(config.attention_type)
         self.is_mqa = self.attention_type != AttentionType.MULTI_HEAD
@@ -139,6 +138,7 @@ class GPT2Attention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
+        self.kv_dim = self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -166,8 +166,7 @@ class GPT2Attention(nn.Module):
                 # Keys and values are shared across heads
                 self.kv_attn = Conv1D(2 * self.head_dim, self.embed_dim)
             else:
-                c_dim = self.embed_dim + 2 * (self.embed_dim if self.is_mqa else self.head_dim)
-                self.c_attn = Conv1D(c_dim, self.embed_dim)
+                self.c_attn = Conv1D(self.embed_dim + 2 * self.kv_dim, self.embed_dim)
 
         self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
 
@@ -197,19 +196,19 @@ class GPT2Attention(nn.Module):
             # Q x K: (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
             # A X V: (b, sq, nh, sk) x (b, sk, hs) -> (b, sq, nh, hs)
             output_view = (x.size(0), x.size(1) * x.size(2), y.size(-1))
-            x=x.view(*output_view[:-1], x.size(-1))
+            # No copy needed for MQA 2, or when layer_past is provided.
+            x = x.reshape(*output_view[:-1], x.size(-1))
         else:
             # Q x K: (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
             # A X V: (b, nh, sq, sk) x (b, nh, sk, hs) -> (b, nh, sq, hs)
             output_view = (x.size(0) * x.size(1), x.size(2), y.size(-1))
-            x=x.view(output_view[0], *x.size()[2:])
-            y=y.view(output_view[0], *y.size()[2:])
-        if scale_factor == 1.0 and dtype is None:
-            # TODO: Is baddbmm identical?
-            z=torch.matmul(x, y)
-        else:
-            z = torch.empty(output_view, dtype=x.dtype if dtype is None else dtype, device=x.device)
-            z = torch.baddbmm(z,x,y,beta=0,alpha=scale_factor)
+            # Always copies
+            x = x.reshape(output_view[0], *x.size()[2:])
+            # No copy when layer_past is provided.
+            y = y.reshape(output_view[0], *y.size()[2:])
+        # This is identical to matmul when scale_factor==1
+        z = torch.empty(output_view, dtype=x.dtype if dtype is None else dtype, device=x.device)
+        z = torch.baddbmm(z, x, y, beta=0, alpha=scale_factor)
         return z.view(output_shape)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None, upcast=False):
@@ -230,17 +229,20 @@ class GPT2Attention(nn.Module):
             key_length = key.size(-2)
             if self.is_mqa:
                 # (b, sq, nh, sk)
-                query_length = query.size(1)
-                causal_mask = self.bias[:, key_length - query_length : key_length, :, :key_length].to(torch.bool)
+                causal_mask = self.bias[None, key_length - query.size(1) : key_length, None, :key_length]
             else:
                 # (b, nh, sq, sk)
-                query_length = query.size(-2)
-                causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
-            mask_value = torch.finfo(attn_weights.dtype).min
-            # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            mask_value = torch.full([], mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-            attn_weights = torch.where(causal_mask, attn_weights, mask_value)
+                causal_mask = self.bias[None, None, key_length - query.size(-2) : key_length, :key_length]
+            # torch.where expects a tensor. We use a cache to avoid recreating it every time.
+            if (
+                self.mask_value is None
+                or self.mask_value.dtype != attn_weights.dtype
+                or self.mask_value.device != attn_weights.device
+            ):
+                self.mask_value = torch.full(
+                    [], torch.finfo(attn_weights.dtype).min, dtype=attn_weights.dtype, device=attn_weights.device
+                )
+            attn_weights = torch.where(causal_mask, attn_weights, self.mask_value)
 
         if attention_mask is not None:
             # Apply the attention mask
