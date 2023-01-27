@@ -35,15 +35,6 @@ class NewGELUActivation(nn.Module):
         return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 
-class NewGELUActivationPython(nn.Module):
-    """
-    Same as NewGELUActivation (up to rounding errors), with a fast C/cuda implementation.
-    """
-
-    def forward(self, input: Tensor) -> Tensor:
-        return nn.functional.gelu(input, approximate="tanh")
-
-
 class GELUActivation(nn.Module):
     """
     Original Implementation of the GELU activation function in Google BERT repo when initially created. For
@@ -163,7 +154,7 @@ ACT2CLS = {
     "gelu_10": (ClippedGELUActivation, {"min": -10, "max": 10}),
     "gelu_fast": FastGELUActivation,
     "gelu_new": NewGELUActivation,
-    "gelu_new_python": NewGELUActivationPython,
+    "gelu_new_python": (nn.GELU, {"approximate": "tanh"}),
     "gelu_python": (GELUActivation, {"use_gelu_python": True}),
     "linear": LinearActivation,
     "mish": MishActivation,
