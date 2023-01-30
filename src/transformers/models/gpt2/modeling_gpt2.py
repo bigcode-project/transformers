@@ -121,7 +121,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 
 
 class GPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None):
+    def __init__(self, config:GPT2Config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         max_positions = config.max_position_embeddings
         self.register_buffer(
@@ -131,6 +131,11 @@ class GPT2Attention(nn.Module):
         # We don't use a buffer because the mask value depends on the dtype,
         # And the dtype will be different if upcasting.
         self.mask_value = None
+
+        self.pre_allocate_cache = config.pre_allocate_cache
+        self.n_positions=config.n_positions
+        self._key_cache = None
+        self._value_cache = None
 
         self.attention_type = AttentionType(config.attention_type)
         self.is_mqa = self.attention_type != AttentionType.MULTI_HEAD
@@ -283,10 +288,35 @@ class GPT2Attention(nn.Module):
         new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
         return tensor.view(new_shape)
 
+    def _get_cache_slice(self, batch_size, key_start, key_stop):
+        slice_left = (slice(batch_size),) if self.is_mqa else (slice(batch_size), slice(None))
+        return slice_left+(slice(key_start,key_stop),slice(None))
+
+    def _cache_key_value(self, key, value, past_key_length):
+        batch_size=key.size(0)
+        key_length=key.size(-2)
+        if past_key_length==0 and (self._key_cache is None or self._key_cache.size(0) < batch_size):
+            # If cache is too small, re-allocate it.
+            # Delete the tensors first to free memory.
+            self._key_cache = None
+            self._value_cache = None
+            self._key_cache, self._value_cache = torch.empty(
+                (batch_size,)+(() if self.is_mqa else (self.num_heads,))+(self.n_positions, 2 * self.head_dim),
+                dtype=key.dtype,
+                device=key.device,
+            ).split((self.head_dim, self.head_dim), dim=-1)
+        new_key_length = past_key_length + key_length
+        slice_left = (slice(batch_size),) if self.is_mqa else (slice(batch_size), slice(None))
+        slice_copy = slice_left + (slice(past_key_length, new_key_length), slice(None))
+        slice_full = slice_left + (slice(new_key_length), slice(None))
+        self._key_cache[slice_copy].copy_(key)
+        self._value_cache[slice_copy].copy_(value)
+        return self._key_cache[slice_full], self._value_cache[slice_full]
+
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -316,7 +346,10 @@ class GPT2Attention(nn.Module):
             key = self._split_heads(key, self.num_heads, self.head_dim)
             value = self._split_heads(value, self.num_heads, self.head_dim)
 
-        if layer_past is not None:
+
+        if use_cache is True and self.pre_allocate_cache:
+            key, value=self._cache_key_value(key, value, past_key_length=0 if layer_past is None else layer_past[0].size(-2))
+        elif layer_past is not None:
             past_key, past_value = layer_past
             key = torch.cat((past_key, key), dim=-2)
             value = torch.cat((past_value, value), dim=-2)
