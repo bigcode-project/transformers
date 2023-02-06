@@ -171,7 +171,10 @@ class GPT2Config(PretrainedConfig):
         scale_attn_by_inverse_layer_idx=False,
         reorder_and_upcast_attn=False,
         attention_type=AttentionType.MULTI_HEAD,
-        pre_allocate_cache=False,
+        # pre_allocate_cache=False,
+        fast_mqa=False,
+        inference_runner=False,
+        cuda_graph=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -201,7 +204,10 @@ class GPT2Config(PretrainedConfig):
 
         # Convert to an int so it's JSON-serializable.
         self.attention_type = AttentionType(attention_type).value
-        self.pre_allocate_cache = pre_allocate_cache
+        # self.pre_allocate_cache = pre_allocate_cache
+        self.fast_mqa = fast_mqa
+        self.inference_runner = inference_runner
+        self.cuda_graph = cuda_graph
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 

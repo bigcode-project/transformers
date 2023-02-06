@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch OpenAI GPT-2 model."""
+from __future__ import annotations
 
 import math
 import os
@@ -121,7 +122,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
 
 
 class GPT2Attention(nn.Module):
-    def __init__(self, config:GPT2Config, is_cross_attention=False, layer_idx=None):
+    def __init__(self, config: GPT2Config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         max_positions = config.max_position_embeddings
         self.register_buffer(
@@ -133,17 +134,20 @@ class GPT2Attention(nn.Module):
         self.mask_value = None
 
         self.pre_allocate_cache = config.pre_allocate_cache
-        self.n_positions=config.n_positions
+        self.n_positions = config.n_positions
         self._key_cache = None
         self._value_cache = None
 
         self.attention_type = AttentionType(config.attention_type)
         self.is_mqa = self.attention_type != AttentionType.MULTI_HEAD
+        self.fast_mqa = config.fast_mqa
+        # TODO: Add checks for fast MQA
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.kv_dim = self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
+        self.kv_heads = 1 if self.is_mqa else self.head_dim
+        self.kv_dim = self.kv_heads * self.head_dim
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -158,6 +162,13 @@ class GPT2Attention(nn.Module):
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
+
+        self.scale_factor = 1.0
+        if self.scale_attn_weights:
+            self.scale_factor /= self.head_dim**0.5
+
+        if self.scale_attn_by_inverse_layer_idx:
+            self.scale_factor /= self.layer_idx + 1
 
         if self.is_cross_attention:
             if self.is_mqa:
@@ -217,16 +228,10 @@ class GPT2Attention(nn.Module):
         return z.view(output_shape)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None, upcast=False):
-        scale_factor = 1.0
-        if self.scale_attn_weights:
-            scale_factor /= value.size(-1) ** 0.5
-
-        if self.scale_attn_by_inverse_layer_idx:
-            scale_factor /= self.layer_idx + 1
 
         with autocast(enabled=False):
             attn_weights = self._matmul(
-                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else None, scale_factor=scale_factor
+                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else None, scale_factor=self.scale_factor
             )
 
         if not self.is_cross_attention:
@@ -290,18 +295,18 @@ class GPT2Attention(nn.Module):
 
     def _get_cache_slice(self, batch_size, key_start, key_stop):
         slice_left = (slice(batch_size),) if self.is_mqa else (slice(batch_size), slice(None))
-        return slice_left+(slice(key_start,key_stop),slice(None))
+        return slice_left + (slice(key_start, key_stop), slice(None))
 
     def _cache_key_value(self, key, value, past_key_length):
-        batch_size=key.size(0)
-        key_length=key.size(-2)
-        if past_key_length==0 and (self._key_cache is None or self._key_cache.size(0) < batch_size):
+        batch_size = key.size(0)
+        key_length = key.size(-2)
+        if past_key_length == 0 and (self._key_cache is None or self._key_cache.size(0) < batch_size):
             # If cache is too small, re-allocate it.
             # Delete the tensors first to free memory.
             self._key_cache = None
             self._value_cache = None
             self._key_cache, self._value_cache = torch.empty(
-                (batch_size,)+(() if self.is_mqa else (self.num_heads,))+(self.n_positions, 2 * self.head_dim),
+                (batch_size,) + (() if self.is_mqa else (self.num_heads,)) + (self.n_positions, 2 * self.head_dim),
                 dtype=key.dtype,
                 device=key.device,
             ).split((self.head_dim, self.head_dim), dim=-1)
@@ -312,6 +317,48 @@ class GPT2Attention(nn.Module):
         self._key_cache[slice_copy].copy_(key)
         self._value_cache[slice_copy].copy_(value)
         return self._key_cache[slice_full], self._value_cache[slice_full]
+
+    def _forward_mqa_inference(
+        self,
+        hidden_states: torch.FloatTensor,
+        layer_past: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.FloatTensor,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], ...]:
+        # Most checks are handled in the first token, using normal forward.
+        # Hidden: (b, 1, hid) -> (b, (nh+2)*hs)
+        # Q: (b, nh*hs)
+        # K, V: (b, hs)
+        query, key, value = torch.addmm(
+            self.c_attn.bias, hidden_states.view(-1, self.embed_dim), self.c_attn.weight
+        ).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=1)
+        past_key, past_value = layer_past
+        # TODO: Could have key already transposed, but would need to change the first not using this function.
+        #       (And might not make any difference)
+        # K, V: (b, sk-1, hs) . (b, 1, hs) -> (b, sk, hs)
+        key = torch.cat((past_key, key.unsqueeze(1)), dim=1)
+        value = torch.cat((past_value, value.unsqueeze(1)), dim=1)
+        batch_size, key_length, _ = key.shape
+
+        # Q x K: (b, nh, hs) x (b, hs, sk) -> (b, nh, sk)
+        attn_weights = torch.baddbmm(
+            torch.empty((batch_size, self.num_heads, key_length), dtype=query.dtype, device=query.device),
+            query.view(-1, self.num_heads, self.head_dim),
+            key.transpose(1, 2),
+            beta=0,
+            alpha=self.scale_factor,
+        )
+        # Causal mask is identity.
+        attn_weights = nn.functional.softmax(attn_weights + attention_mask.squeeze(2), dim=-1)
+
+        # A X V: (b, nh, sk) x (b, sk, hs) -> (b, nh, hs)
+        # TODO: bmm is faster?
+        attn_output = torch.matmul(attn_weights, value)
+
+        # Projection: (b, nh*hs) x (nh*hs, hid) -> (b, hid)
+        attn_output = torch.addmm(
+            self.c_proj.bias, attn_output.view(-1, self.embed_dim), self.c_proj.weight
+        ).unsqueeze(1)
+        return attn_output, (key, value)
 
     def forward(
         self,
@@ -324,6 +371,8 @@ class GPT2Attention(nn.Module):
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], ...]:
+        if self.fast_mqa and layer_past is not None:
+            return self._forward_mqa_inference(hidden_states, layer_past, attention_mask)
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn") or not self.is_cross_attention:
                 raise ValueError(
@@ -346,9 +395,10 @@ class GPT2Attention(nn.Module):
             key = self._split_heads(key, self.num_heads, self.head_dim)
             value = self._split_heads(value, self.num_heads, self.head_dim)
 
-
         if use_cache is True and self.pre_allocate_cache:
-            key, value=self._cache_key_value(key, value, past_key_length=0 if layer_past is None else layer_past[0].size(-2))
+            key, value = self._cache_key_value(
+                key, value, past_key_length=0 if layer_past is None else layer_past[0].size(-2)
+            )
         elif layer_past is not None:
             past_key, past_value = layer_past
             key = torch.cat((past_key, key), dim=-2)
@@ -391,11 +441,184 @@ class GPT2MLP(nn.Module):
         return hidden_states
 
 
+class GPT2InferenceRunner:
+    def __init__(self, config: GPT2Config, model: GPT2Model):
+        self.batch_size = None
+        self.model = model
+        self.n_layer = len(self.model.h)
+
+        self.cuda_graph = config.cuda_graph
+        self.cuda_graphs = None
+
+        # TODO: Allow smaller to avoid OOM
+        self.max_sequence_length = config.n_positions
+        # self.max_batch_size=None
+        self.device = None
+        self.dtype = None
+
+    def _allocate(self, batch_size, device, dtype):
+        block: GPT2Block = self.model.h[0]
+        attn = block.attn
+        if not attn.is_mqa:
+            raise NotImplementedError()
+        self.batch_size = batch_size
+        self.dtype = dtype
+        self.device = device
+        factory_kwargs = {"device": self.device, "dtype": self.dtype}
+
+        hidden_end = attn.embed_dim
+        query_end = hidden_end + attn.embed_dim
+        kv_end = query_end + 2 * attn.kv_dim
+        attn_weights_end = kv_end + attn.num_heads * self.max_sequence_length
+        c_proj_end = query_end + attn.embed_dim
+        pool_channels = max(attn_weights_end, c_proj_end)
+        activation_pool = torch.empty((self.batch_size, pool_channels), **factory_kwargs)
+        kv_cache = torch.empty(
+            (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim),
+            **factory_kwargs,
+        )
+
+        self.hidden_states_squeezed = activation_pool[:, :hidden_end]
+        self.hidden_states = self.hidden_states_squeezed.unsqueeze(1)
+        self.c_attn = activation_pool[:, hidden_end:kv_end]
+        self.query = activation_pool[:, hidden_end:query_end].view(self.batch_size, attn.num_heads, attn.head_dim)
+        self.kv_attn = activation_pool[:, query_end:kv_end]
+
+        self.kv_caches = (kv_cache.squeeze(2) if attn.is_mqa else kv_cache).unbind(0)
+        self.kv_caches_unbound = [cache.unbind(-2) for cache in self.kv_caches]
+
+        head_slice = 0 if attn.is_mqa else slice(None)
+        key, value = kv_cache.split((attn.head_dim, attn.head_dim), dim=-1)
+        key = key.transpose(3, 4)
+        # TODO: Is this slow? CPU Memory usage?
+        self.keys_values = [
+            [
+                (key[layer_idx, :, head_slice, :, :key_length], value[layer_idx, :, head_slice, :key_length, :])
+                for key_length in range(self.max_sequence_length)
+            ]
+            for layer_idx in range(self.n_layer)
+        ]
+        attn_weights = activation_pool[:, kv_end:attn_weights_end].view(
+            self.batch_size, attn.num_heads, self.max_sequence_length
+        )
+        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length)]
+
+        self.attn_output = activation_pool[:, hidden_end:query_end]
+        self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
+        self.c_proj = activation_pool[:, query_end:c_proj_end]
+
+        # TODO: MLP
+
+        self._generate_cuda_graphs()
+
+    def _generate_cuda_graphs(self):
+        memory_pool = None
+        self.cuda_graphs = []
+        for layer_idx in range(self.n_layer + 1):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=memory_pool):
+                if layer_idx > 0:
+                    self._forward_post_attn(self.model.h[layer_idx - 1])
+                if layer_idx < self.n_layer:
+                    self._forward_qkv(self.model.h[layer_idx])
+                else:
+                    self.output_hidden_states = self._forward_end()
+            if memory_pool is None:
+                memory_pool = graph.pool()
+            self.cuda_graphs.append(graph)
+
+    def _forward_embed(self, input_ids, position_ids):
+        inputs_embeds = self.model.wte(input_ids)
+        position_embeds = self.model.wpe(position_ids)
+        torch.add(inputs_embeds, position_embeds, out=self.hidden_states)
+
+    def _forward_qkv(self, block: GPT2Block):
+        hidden_states = block.ln_1(self.hidden_states_squeezed)
+        torch.addmm(
+            block.attn.c_attn.bias,
+            hidden_states,
+            block.attn.c_attn.weight,
+            out=self.c_attn,
+        )
+
+    def _forward_attn(self, block: GPT2Block, attention_mask, key_length):
+        self.kv_caches_unbound[block.attn.layer_idx][key_length - 1].copy_(self.kv_attn)
+        key, value = self.keys_values[block.attn.layer_idx][key_length]
+        attn_weights = self.attn_weights[key_length]
+        torch.baddbmm(
+            attn_weights,
+            self.query,
+            key,
+            beta=0,
+            alpha=block.attn.scale_factor,
+        )
+        # Causal mask is identity.
+        # Inplace to save memory.
+        attn_weights.add_(attention_mask.squeeze(2))
+        torch.softmax(attn_weights, dim=-1, out=attn_weights)
+        torch.bmm(attn_weights, value, out=self.attn_output_expanded)
+        return key, value
+
+    def _forward_post_attn(self, block: GPT2Block):
+        torch.addmm(
+            block.attn.c_proj.bias,
+            self.attn_output,
+            block.attn.c_proj.weight,
+            out=self.c_proj,
+        )
+        self.hidden_states_squeezed.add_(self.c_proj)
+        # TODO: MLP
+        feed_forward_hidden_states = block.mlp(self.hidden_states_squeezed)
+        self.hidden_states_squeezed.add_(feed_forward_hidden_states)
+
+    def _forward_end(self):
+        return self.model.ln_f(self.hidden_states)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        key_length: int,
+        attention_mask: torch.FloatTensor,
+        position_ids: torch.LongTensor,
+    ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        batch_size, query_length = input_ids.shape
+        assert query_length == 1
+        if self.batch_size is None:
+            self._allocate(batch_size, device=input_ids.device, dtype=self.model.dtype)
+        else:
+            assert batch_size == self.batch_size
+
+        assert attention_mask.device == self.device
+        attention_mask = (1.0 - attention_mask[:, None, :].to(dtype=self.dtype, device=self.device)) * torch.finfo(
+            self.dtype
+        ).min
+
+        self._forward_embed(input_ids, position_ids)
+
+        if self.cuda_graph:
+            for i, block in enumerate(self.model.h):
+                self.cuda_graphs[i].replay()
+                self._forward_attn(block, attention_mask, key_length)
+            self.cuda_graphs[self.n_layer].replay()
+            hidden_states = self.output_hidden_states
+        else:
+            for block in self.model.h:
+                self._forward_qkv(block)
+                self._forward_attn(block, attention_mask, key_length)
+                self._forward_post_attn(block)
+            hidden_states = self._forward_end()
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=key_length,
+        )
+
+
 class GPT2Block(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
-        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
+        self.inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(config, layer_idx=layer_idx)
@@ -407,7 +630,7 @@ class GPT2Block(nn.Module):
             self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = GPT2MLP(inner_dim, config)
+        self.mlp = GPT2MLP(self.inner_dim, config)
 
     def forward(
         self,
@@ -714,6 +937,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        self.inference_runner = GPT2InferenceRunner(config, self) if config.inference_runner else None
 
         # Model parallel
         self.model_parallel = False
@@ -779,7 +1003,7 @@ class GPT2Model(GPT2PreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Union[Tuple[Tuple[torch.Tensor, torch.Tensor]], int]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -792,6 +1016,21 @@ class GPT2Model(GPT2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        if self.inference_runner is not None and past_key_values is not None:
+            assert input_ids is not None
+            assert isinstance(past_key_values, int)
+            assert attention_mask is not None
+            assert token_type_ids is None
+            assert position_ids is not None
+            assert head_mask is None
+            assert inputs_embeds is None
+            assert encoder_hidden_states is None
+            assert encoder_attention_mask is None
+            assert use_cache is None
+            assert not output_attentions
+            assert not output_hidden_states
+            assert return_dict
+            return self.inference_runner.forward(input_ids, past_key_values + 1, attention_mask, position_ids)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -934,7 +1173,7 @@ class GPT2Model(GPT2PreTrainedModel):
                 )
 
             hidden_states = outputs[0]
-            if use_cache is True:
+            if use_cache is True and self.inference_runner is None:
                 presents = presents + (outputs[1],)
 
             if output_attentions:
@@ -954,6 +1193,9 @@ class GPT2Model(GPT2PreTrainedModel):
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if self.inference_runner is not None:
+            presents = input_shape[-1] + past_length
 
         if not return_dict:
             return tuple(
