@@ -51,6 +51,8 @@ from .utils import (
     is_apex_available,
     is_bitsandbytes_available,
     is_bs4_available,
+    is_cython_available,
+    is_decord_available,
     is_detectron2_available,
     is_faiss_available,
     is_flax_available,
@@ -82,6 +84,7 @@ from .utils import (
     is_torch_available,
     is_torch_bf16_cpu_available,
     is_torch_bf16_gpu_available,
+    is_torch_neuroncore_available,
     is_torch_tensorrt_fx_available,
     is_torch_tf32_available,
     is_torch_tpu_available,
@@ -446,6 +449,13 @@ def require_spacy(test_case):
     return unittest.skipUnless(is_spacy_available(), "test requires spacy")(test_case)
 
 
+def require_decord(test_case):
+    """
+    Decorator marking a test that requires decord. These tests are skipped when decord isn't installed.
+    """
+    return unittest.skipUnless(is_decord_available(), "test requires decord")(test_case)
+
+
 def require_torch_multi_gpu(test_case):
     """
     Decorator marking a test that requires a multi-GPU setup (in PyTorch). These tests are skipped on a machine without
@@ -490,6 +500,15 @@ def require_torch_tpu(test_case):
     Decorator marking a test that requires a TPU (in PyTorch).
     """
     return unittest.skipUnless(is_torch_tpu_available(check_device=False), "test requires PyTorch TPU")(test_case)
+
+
+def require_torch_neuroncore(test_case):
+    """
+    Decorator marking a test that requires NeuronCore (in PyTorch).
+    """
+    return unittest.skipUnless(is_torch_neuroncore_available(check_device=False), "test requires PyTorch NeuronCore")(
+        test_case
+    )
 
 
 if is_torch_available():
@@ -691,6 +710,13 @@ def require_jumanpp(test_case):
     Decorator marking a test that requires jumanpp
     """
     return unittest.skipUnless(is_jumanpp_available(), "test requires jumanpp")(test_case)
+
+
+def require_cython(test_case):
+    """
+    Decorator marking a test that requires jumanpp
+    """
+    return unittest.skipUnless(is_cython_available(), "test requires cython")(test_case)
 
 
 def get_gpu_count():
