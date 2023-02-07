@@ -386,19 +386,27 @@ class GPT2InferenceRunner:
         factory_kwargs = {"device": self.device, "dtype": self.dtype}
 
         hidden_end = attn.embed_dim
+        # Query: (bs, embed_dim), also used for attn outputs (no overlap with value).
         query_end = hidden_end + attn.embed_dim
+        # KV: (bs, 2 * kv_dim), combines with query into c_attn.
         kv_end = query_end + 2 * attn.kv_dim
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value
         attn_weights_end = kv_end + attn.num_heads * self.max_sequence_length
+        # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
+        # Also used for MLP projection ()
         c_proj_end = query_end + attn.embed_dim
-        pool_channels = max(attn_weights_end, c_proj_end)
+        c_fc_end=hidden_end + block.inner_dim
+        pool_channels = max(attn_weights_end, c_proj_end, c_fc_end)
         activation_pool = torch.empty((self.batch_size, pool_channels), **factory_kwargs)
         kv_cache = torch.empty(
             (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim),
             **factory_kwargs,
         )
 
+        # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
         self.hidden_states_squeezed = activation_pool[:, :hidden_end]
         self.hidden_states = self.hidden_states_squeezed.unsqueeze(1)
+        # QKV: (bs, 2 * kv_dim).
         self.c_attn = activation_pool[:, hidden_end:kv_end]
         self.query = activation_pool[:, hidden_end:query_end].view(self.batch_size, attn.num_heads, attn.head_dim)
         self.kv_attn = activation_pool[:, query_end:kv_end]
@@ -417,16 +425,23 @@ class GPT2InferenceRunner:
             ]
             for layer_idx in range(self.n_layer)
         ]
+
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
         attn_weights = activation_pool[:, kv_end:attn_weights_end].view(
             self.batch_size, attn.num_heads, self.max_sequence_length
         )
         self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length)]
 
+        # Attn outputs: (batch_size, embed_dim), no overlap with value.
         self.attn_output = activation_pool[:, hidden_end:query_end]
         self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
+        # Attn projection: (batch_size, embed_dim), no overlap with attn outputs.
         self.c_proj = activation_pool[:, query_end:c_proj_end]
 
-        # TODO: MLP
+        # MLP first layer: (batch_size, embed_dim)
+        self.mlp_c_fc = activation_pool[:, hidden_end:query_end]
+        # MLP projection: (batch_size, inner_dim)
+        self.mlp_c_proj = activation_pool[:, hidden_end:c_fc_end]
 
         self._generate_cuda_graphs()
 
@@ -447,11 +462,13 @@ class GPT2InferenceRunner:
             self.cuda_graphs.append(graph)
 
     def _forward_embed(self, input_ids, position_ids):
+        # Embedding doesn't support out argument.
         inputs_embeds = self.model.wte(input_ids)
         position_embeds = self.model.wpe(position_ids)
         torch.add(inputs_embeds, position_embeds, out=self.hidden_states)
 
     def _forward_qkv(self, block):
+        # LN doesn't support out argument.
         hidden_states = block.ln_1(self.hidden_states_squeezed)
         torch.addmm(
             block.attn.c_attn.bias,
@@ -472,7 +489,7 @@ class GPT2InferenceRunner:
             alpha=block.attn.scale_factor,
         )
         # Causal mask is identity.
-        # Inplace to save memory.
+        # Ops are safe to do inplace.
         attn_weights.add_(attention_mask.squeeze(2))
         torch.softmax(attn_weights, dim=-1, out=attn_weights)
         torch.bmm(attn_weights, value, out=self.attn_output_expanded)
@@ -486,11 +503,15 @@ class GPT2InferenceRunner:
             out=self.c_proj,
         )
         self.hidden_states_squeezed.add_(self.c_proj)
-        # TODO: MLP
-        feed_forward_hidden_states = block.mlp(self.hidden_states_squeezed)
-        self.hidden_states_squeezed.add_(feed_forward_hidden_states)
+
+        torch.addmm(block.mlp.c_fc.bias, self.hidden_states_squeezed, block.mlp.c_fc.weight, out=self.mlp_c_fc)
+        # Most activations don't support out argument.
+        feed_forward_hidden_states = block.mlp.act(self.mlp_c_fc)
+        torch.addmm(block.mlp.c_proj.bias, feed_forward_hidden_states, block.mlp.c_proj.weight, out=self.mlp_c_proj)
+        self.hidden_states_squeezed.add_(self.c_proj)
 
     def _forward_end(self):
+        # LN doesn't support out argument.
         return self.model.ln_f(self.hidden_states)
 
     def forward(
