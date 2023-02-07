@@ -15,7 +15,6 @@
 # limitations under the License.
 """ OpenAI GPT-2 configuration"""
 from collections import OrderedDict
-from enum import Enum
 from typing import Any, List, Mapping, Optional
 
 from transformers import PreTrainedTokenizer, TensorType, is_torch_available
@@ -34,12 +33,6 @@ GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "gpt2-xl": "https://huggingface.co/gpt2-xl/resolve/main/config.json",
     "distilgpt2": "https://huggingface.co/distilgpt2/resolve/main/config.json",
 }
-
-
-class AttentionType(Enum):
-    MULTI_HEAD = 1
-    MULTI_QUERY_1 = 2
-    MULTI_QUERY_2 = 3
 
 
 class GPT2Config(PretrainedConfig):
@@ -170,7 +163,6 @@ class GPT2Config(PretrainedConfig):
         eos_token_id=50256,
         scale_attn_by_inverse_layer_idx=False,
         reorder_and_upcast_attn=False,
-        attention_type=AttentionType.MULTI_HEAD,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -197,9 +189,6 @@ class GPT2Config(PretrainedConfig):
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
-
-        # Convert to an int so it's JSON-serializable.
-        self.attention_type = AttentionType(attention_type).value
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
