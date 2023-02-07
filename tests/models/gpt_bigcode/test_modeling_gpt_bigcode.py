@@ -36,7 +36,7 @@ if is_torch_available():
         GPTBigCodeForTokenClassification,
         GPTBigCodeLMHeadModel,
         GPTBigCodeModel,
-        GPTBigCodeTokenizer,
+        GPT2Tokenizer,
     )
 
 
@@ -526,7 +526,7 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
     def test_batch_generation(self):
         model = GPTBigCodeLMHeadModel.from_pretrained("gpt2")
         model.to(torch_device)
-        tokenizer = GPTBigCodeTokenizer.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
         tokenizer.padding_side = "left"
 
@@ -585,7 +585,7 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
     def test_batch_generation_2heads(self):
         model = GPTBigCodeDoubleHeadsModel.from_pretrained("gpt2")
         model.to(torch_device)
-        tokenizer = GPTBigCodeTokenizer.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
         tokenizer.padding_side = "left"
 
@@ -699,7 +699,7 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
 
     @slow
     def test_gpt_bigcode_sample(self):
-        tokenizer = GPTBigCodeTokenizer.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         model = GPTBigCodeLMHeadModel.from_pretrained("gpt2")
         model.to(torch_device)
 
@@ -773,7 +773,7 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
             "laboratory founded in 2010. DeepMind was acquired by Google in 2014. The company is based"
         )
 
-        gpt_bigcode_tokenizer = GPTBigCodeTokenizer.from_pretrained("gpt2-large")
+        gpt_bigcode_tokenizer = GPT2Tokenizer.from_pretrained("gpt2-large")
         gpt_bigcode_model = GPTBigCodeLMHeadModel.from_pretrained("gpt2-large").to(torch_device)
         input_ids = gpt_bigcode_tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
 
