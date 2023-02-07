@@ -32,6 +32,8 @@
 # in your path, i.e., /path/to/Megatron-DeepSpeed/
 #
 
+# TODO: Update this file
+
 import argparse
 import os
 import re
