@@ -355,11 +355,216 @@ class GPTBigCodeMLP(nn.Module):
         return hidden_states
 
 
+class GPTBigCodeInferenceRunner:
+    def __init__(self, config: GPTBigCodeConfig, model):
+        self.batch_size = None
+        self.model = model
+        self.n_layer = len(self.model.h)
+
+        self.cuda_graph = config.cuda_graph
+        self.cuda_graphs = None
+
+        # TODO: Allow smaller to avoid OOM
+        self.max_sequence_length = config.n_positions
+        # self.max_batch_size=None
+        self.device = None
+        self.dtype = None
+
+    def _allocate(self, batch_size, device, dtype):
+        block: GPTBigCodeBlock = self.model.h[0]
+        attn = block.attn
+        if not attn.is_mqa:
+            raise NotImplementedError()
+        self.batch_size = batch_size
+        self.dtype = dtype
+        self.device = device
+        factory_kwargs = {"device": self.device, "dtype": self.dtype}
+
+        hidden_end = attn.embed_dim
+        # Query: (bs, embed_dim), also used for attn outputs (no overlap with value).
+        query_end = hidden_end + attn.embed_dim
+        # KV: (bs, 2 * kv_dim), combines with query into c_attn.
+        kv_end = query_end + 2 * attn.kv_dim
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value
+        attn_weights_end = kv_end + attn.num_heads * self.max_sequence_length
+        # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
+        # Also used for MLP projection ()
+        c_proj_end = query_end + attn.embed_dim
+        c_fc_end = hidden_end + block.inner_dim
+        pool_channels = max(attn_weights_end, c_proj_end, c_fc_end)
+        activation_pool = torch.empty((self.batch_size, pool_channels), **factory_kwargs)
+        kv_cache = torch.empty(
+            (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim),
+            **factory_kwargs,
+        )
+
+        # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
+        self.hidden_states_squeezed = activation_pool[:, :hidden_end]
+        self.hidden_states = self.hidden_states_squeezed.unsqueeze(1)
+        # QKV: (bs, 2 * kv_dim).
+        self.c_attn = activation_pool[:, hidden_end:kv_end]
+        self.query = activation_pool[:, hidden_end:query_end].view(self.batch_size, attn.num_heads, attn.head_dim)
+        self.kv_attn = activation_pool[:, query_end:kv_end]
+
+        self.kv_caches = (kv_cache.squeeze(2) if attn.is_mqa else kv_cache).unbind(0)
+        self.kv_caches_unbound = [cache.unbind(-2) for cache in self.kv_caches]
+
+        head_slice = 0 if attn.is_mqa else slice(None)
+        key, value = kv_cache.split((attn.head_dim, attn.head_dim), dim=-1)
+        key = key.transpose(-1, -2)
+        # TODO: Is this slow? CPU Memory usage?
+        self.keys_values = [
+            [
+                (key[layer_idx, :, head_slice, :, :key_length], value[layer_idx, :, head_slice, :key_length, :])
+                for key_length in range(self.max_sequence_length)
+            ]
+            for layer_idx in range(self.n_layer)
+        ]
+
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
+        attn_weights = activation_pool[:, kv_end:attn_weights_end].view(
+            self.batch_size, attn.num_heads, self.max_sequence_length
+        )
+        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length)]
+
+        # Attn outputs: (batch_size, embed_dim), no overlap with value.
+        self.attn_output = activation_pool[:, hidden_end:query_end]
+        self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
+        # Attn projection: (batch_size, embed_dim), no overlap with attn outputs.
+        self.c_proj = activation_pool[:, query_end:c_proj_end]
+
+        # MLP first layer: (batch_size, embed_dim)
+        self.mlp_c_fc = activation_pool[:, hidden_end:query_end]
+        # MLP projection: (batch_size, inner_dim)
+        self.mlp_c_proj = activation_pool[:, hidden_end:c_fc_end]
+
+        self._generate_cuda_graphs()
+
+    def _generate_cuda_graphs(self):
+        memory_pool = None
+        self.cuda_graphs = []
+        for layer_idx in range(self.n_layer + 1):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=memory_pool):
+                if layer_idx > 0:
+                    self._forward_post_attn(self.model.h[layer_idx - 1])
+                if layer_idx < self.n_layer:
+                    self._forward_qkv(self.model.h[layer_idx])
+                else:
+                    self.output_hidden_states = self._forward_end()
+            if memory_pool is None:
+                memory_pool = graph.pool()
+            self.cuda_graphs.append(graph)
+
+    def _forward_embed(self, input_ids, position_ids):
+        # Embedding doesn't support out argument.
+        inputs_embeds = self.model.wte(input_ids)
+        position_embeds = self.model.wpe(position_ids)
+        torch.add(inputs_embeds, position_embeds, out=self.hidden_states)
+
+    def _forward_qkv(self, block):
+        # LN doesn't support out argument.
+        hidden_states = block.ln_1(self.hidden_states_squeezed)
+        torch.addmm(
+            block.attn.c_attn.bias,
+            hidden_states,
+            block.attn.c_attn.weight,
+            out=self.c_attn,
+        )
+
+    def _forward_attn(self, block, attention_mask, key_length):
+        self.kv_caches_unbound[block.attn.layer_idx][key_length - 1].copy_(self.kv_attn)
+        key, value = self.keys_values[block.attn.layer_idx][key_length]
+        attn_weights = self.attn_weights[key_length]
+        torch.baddbmm(
+            attn_weights,
+            self.query,
+            key,
+            beta=0,
+            alpha=block.attn.scale_factor,
+        )
+        # Causal mask is identity.
+        # Ops are safe to do inplace.
+        attn_weights.add_(attention_mask.squeeze(2))
+        torch.softmax(attn_weights, dim=-1, out=attn_weights)
+        torch.bmm(attn_weights, value, out=self.attn_output_expanded)
+        return key, value
+
+    def _forward_post_attn(self, block):
+        torch.addmm(
+            block.attn.c_proj.bias,
+            self.attn_output,
+            block.attn.c_proj.weight,
+            out=self.c_proj,
+        )
+        self.hidden_states_squeezed.add_(self.c_proj)
+
+        torch.addmm(block.mlp.c_fc.bias, self.hidden_states_squeezed, block.mlp.c_fc.weight, out=self.mlp_c_fc)
+        # Most activations don't support out argument.
+        feed_forward_hidden_states = block.mlp.act(self.mlp_c_fc)
+        torch.addmm(block.mlp.c_proj.bias, feed_forward_hidden_states, block.mlp.c_proj.weight, out=self.mlp_c_proj)
+        self.hidden_states_squeezed.add_(self.c_proj)
+
+    def _forward_end(self):
+        # LN doesn't support out argument.
+        return self.model.ln_f(self.hidden_states)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Union[Tuple[Tuple[torch.Tensor, torch.Tensor]], int],
+        attention_mask: torch.FloatTensor,
+        position_ids: torch.LongTensor,
+    ) -> BaseModelOutputWithPastAndCrossAttentions:
+        batch_size, query_length = input_ids.shape
+        assert query_length == 1
+        if self.batch_size is None:
+            self._allocate(batch_size, device=input_ids.device, dtype=self.model.dtype)
+        else:
+            assert batch_size == self.batch_size
+
+        assert attention_mask.device == self.device
+        attention_mask = (1.0 - attention_mask[:, None, :].to(dtype=self.dtype, device=self.device)) * torch.finfo(
+            self.dtype
+        ).min
+
+        self._forward_embed(input_ids, position_ids)
+
+        if isinstance(past_key_values, int):
+            past_key_length = past_key_values
+        else:
+            past_key_length = past_key_values[0][0].shape[-2]
+            for layer_idx, (key, value) in enumerate(past_key_values):
+                key_, value_ = self.keys_values[layer_idx][past_key_length]
+                key_.copy_(key.transpose(-1, -2))
+                value_.copy_(value)
+
+        key_length = past_key_length + 1
+
+        if self.cuda_graph:
+            for i, block in enumerate(self.model.h):
+                self.cuda_graphs[i].replay()
+                self._forward_attn(block, attention_mask, key_length)
+            self.cuda_graphs[self.n_layer].replay()
+            hidden_states = self.output_hidden_states
+        else:
+            for block in self.model.h:
+                self._forward_qkv(block)
+                self._forward_attn(block, attention_mask, key_length)
+                self._forward_post_attn(block)
+            hidden_states = self._forward_end()
+
+        return BaseModelOutputWithPastAndCrossAttentions(
+            last_hidden_state=hidden_states,
+            past_key_values=key_length,
+        )
+
+
 class GPTBigCodeBlock(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
-        inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
+        self.inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPTBigCodeAttention(config, layer_idx=layer_idx)
@@ -371,7 +576,7 @@ class GPTBigCodeBlock(nn.Module):
             self.crossattention = GPTBigCodeAttention(config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = GPTBigCodeMLP(inner_dim, config)
+        self.mlp = GPTBigCodeMLP(self.inner_dim, config)
 
     def forward(
         self,
@@ -679,6 +884,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
+        self.inference_runner = GPTBigCodeInferenceRunner(config, self) if config.inference_runner else None
+
         # Model parallel
         self.model_parallel = False
         self.device_map = None
@@ -742,7 +949,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[Union[Tuple[Tuple[torch.Tensor, torch.Tensor]], int]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -755,6 +962,21 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+        if self.inference_runner is not None and past_key_values is not None:
+            assert input_ids is not None
+            assert past_key_values is not None
+            assert attention_mask is not None
+            assert token_type_ids is None
+            assert position_ids is not None
+            assert head_mask is None
+            assert inputs_embeds is None
+            assert encoder_hidden_states is None
+            assert encoder_attention_mask is None
+            assert use_cache is None
+            assert not output_attentions
+            assert not output_hidden_states
+            assert return_dict
+            return self.inference_runner.forward(input_ids, past_key_values, attention_mask, position_ids)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
