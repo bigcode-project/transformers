@@ -202,6 +202,7 @@ class GPTBigCodeConfig(PretrainedConfig):
 
 
 class GPTBigCodeOnnxConfig(OnnxConfigWithPast):
+    # TODO: Onnx support?
     def __init__(
         self,
         config: PretrainedConfig,
