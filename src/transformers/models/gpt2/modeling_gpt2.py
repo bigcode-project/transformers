@@ -64,7 +64,6 @@ GPT2_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     """Load tf checkpoints in a pytorch model"""
-    # TODO: Update this.
     try:
         import re
 

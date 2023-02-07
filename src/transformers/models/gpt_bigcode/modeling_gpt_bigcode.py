@@ -59,6 +59,7 @@ GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 def load_tf_weights_in_gpt_bigcode(model, config, gpt_bigcode_checkpoint_path):
     """Load tf checkpoints in a pytorch model"""
+    # TODO: Update this.
     try:
         import re
 
