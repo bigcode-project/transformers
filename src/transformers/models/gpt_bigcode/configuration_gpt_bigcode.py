@@ -150,7 +150,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         n_layer=12,
         n_head=12,
         n_inner=None,
-        activation_function="gelu_new",
+        activation_function="gelu_pytorch_tanh",
         resid_pdrop=0.1,
         embd_pdrop=0.1,
         attn_pdrop=0.1,
