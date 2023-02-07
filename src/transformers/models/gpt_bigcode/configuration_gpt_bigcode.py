@@ -26,18 +26,15 @@ from ...utils import logging
 
 logger = logging.get_logger(__name__)
 
-GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    "gpt2": "https://huggingface.co/gpt2/resolve/main/config.json",
-    "gpt2-medium": "https://huggingface.co/gpt2-medium/resolve/main/config.json",
-    "gpt2-large": "https://huggingface.co/gpt2-large/resolve/main/config.json",
-    "gpt2-xl": "https://huggingface.co/gpt2-xl/resolve/main/config.json",
-    "distilgpt2": "https://huggingface.co/distilgpt2/resolve/main/config.json",
+GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP = {
+    # TODO: Add support for santa models.
 }
 
 
-class GPT2Config(PretrainedConfig):
+class GPTBigCodeConfig(PretrainedConfig):
     """
-    This is the configuration class to store the configuration of a [`GPT2Model`] or a [`TFGPT2Model`]. It is used to
+    # TODO: Update doc
+    This is the configuration class to store the configuration of a [`GPTBigCodeModel`] or a [`TFGPTBigCodeModel`]. It is used to
     instantiate a GPT-2 model according to the specified arguments, defining the model architecture. Instantiating a
     configuration with the defaults will yield a similar configuration to that of the GPT-2
     [gpt2](https://huggingface.co/gpt2) architecture.
@@ -49,7 +46,7 @@ class GPT2Config(PretrainedConfig):
     Args:
         vocab_size (`int`, *optional*, defaults to 50257):
             Vocabulary size of the GPT-2 model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`GPT2Model`] or [`TFGPT2Model`].
+            `inputs_ids` passed when calling [`GPTBigCodeModel`] or [`TFGPTBigCodeModel`].
         n_positions (`int`, *optional*, defaults to 1024):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 512 or 1024 or 2048).
@@ -74,8 +71,8 @@ class GPT2Config(PretrainedConfig):
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         summary_type (`string`, *optional*, defaults to `"cls_index"`):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
+            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
+            [`TFGPTBigCodeDoubleHeadsModel`].
 
             Has to be one of the following options:
 
@@ -85,23 +82,23 @@ class GPT2Config(PretrainedConfig):
                 - `"cls_index"`: Supply a Tensor of classification token position (like GPT/GPT-2).
                 - `"attn"`: Not implemented now, use multi-head attention.
         summary_use_proj (`bool`, *optional*, defaults to `True`):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
+            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
+            [`TFGPTBigCodeDoubleHeadsModel`].
 
             Whether or not to add a projection after the vector extraction.
         summary_activation (`str`, *optional*):
             Argument used when doing sequence summary. Used in for the multiple choice head in
-            [`GPT2DoubleHeadsModel`].
+            [`GPTBigCodeDoubleHeadsModel`].
 
             Pass `"tanh"` for a tanh activation to the output, any other value will result in no activation.
         summary_proj_to_labels (`bool`, *optional*, defaults to `True`):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
+            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
+            [`TFGPTBigCodeDoubleHeadsModel`].
 
             Whether the projection outputs should have `config.num_labels` or `config.hidden_size` classes.
         summary_first_dropout (`float`, *optional*, defaults to 0.1):
-            Argument used when doing sequence summary, used in the models [`GPT2DoubleHeadsModel`] and
-            [`TFGPT2DoubleHeadsModel`].
+            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
+            [`TFGPTBigCodeDoubleHeadsModel`].
 
             The dropout ratio to be used after the projection and activation.
         scale_attn_weights (`bool`, *optional*, defaults to `True`):
@@ -117,19 +114,19 @@ class GPT2Config(PretrainedConfig):
     Example:
 
     ```python
-    >>> from transformers import GPT2Config, GPT2Model
+    >>> from transformers import GPTBigCodeConfig, GPTBigCodeModel
 
-    >>> # Initializing a GPT2 configuration
-    >>> configuration = GPT2Config()
+    >>> # Initializing a GPTBigCode configuration
+    >>> configuration = GPTBigCodeConfig()
 
     >>> # Initializing a model (with random weights) from the configuration
-    >>> model = GPT2Model(configuration)
+    >>> model = GPTBigCodeModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "gpt2"
+    model_type = "gpt_bigcode"
     keys_to_ignore_at_inference = ["past_key_values"]
     attribute_map = {
         "hidden_size": "n_embd",
@@ -193,7 +190,8 @@ class GPT2Config(PretrainedConfig):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
 
-class GPT2OnnxConfig(OnnxConfigWithPast):
+class GPTBigCodeOnnxConfig(OnnxConfigWithPast):
+    # TODO: Onnx support?
     def __init__(
         self,
         config: PretrainedConfig,

@@ -44,26 +44,22 @@ from ...utils import (
     replace_return_docstrings,
 )
 from ...utils.model_parallel_utils import assert_device_map, get_device_map
-from .configuration_gpt2 import GPT2Config
+from .configuration_gpt_bigcode import GPTBigCodeConfig
 
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "gpt2"
-_CONFIG_FOR_DOC = "GPT2Config"
+_CHECKPOINT_FOR_DOC = "gpt_bigcode"
+_CONFIG_FOR_DOC = "GPTBigCodeConfig"
 
-GPT2_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    "gpt2",
-    "gpt2-medium",
-    "gpt2-large",
-    "gpt2-xl",
-    "distilgpt2",
-    # See all GPT-2 models at https://huggingface.co/models?filter=gpt2
+GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
+    # TODO: Add support for santa models.
 ]
 
 
-def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
+def load_tf_weights_in_gpt_bigcode(model, config, gpt_bigcode_checkpoint_path):
     """Load tf checkpoints in a pytorch model"""
+    # TODO: Update this.
     try:
         import re
 
@@ -74,7 +70,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
             "https://www.tensorflow.org/install/ for installation instructions."
         )
         raise
-    tf_path = os.path.abspath(gpt2_checkpoint_path)
+    tf_path = os.path.abspath(gpt_bigcode_checkpoint_path)
     logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
     # Load weights from TF model
     init_vars = tf.train.list_variables(tf_path)
@@ -119,7 +115,7 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     return model
 
 
-class GPT2Attention(nn.Module):
+class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
 
@@ -300,7 +296,7 @@ class GPT2Attention(nn.Module):
             if not hasattr(self, "q_attn"):
                 raise ValueError(
                     "If class is used as cross attention, the weights `q_attn` have to be defined. "
-                    "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
+                    "Please make sure to instantiate class with `GPTBigCodeAttention(..., is_cross_attention=True)`."
                 )
 
             query = self.q_attn(hidden_states)
@@ -339,7 +335,7 @@ class GPT2Attention(nn.Module):
         return outputs  # a, present, (attentions)
 
 
-class GPT2MLP(nn.Module):
+class GPTBigCodeMLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
         embed_dim = config.hidden_size
@@ -356,21 +352,21 @@ class GPT2MLP(nn.Module):
         return hidden_states
 
 
-class GPT2Block(nn.Module):
+class GPTBigCodeBlock(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(config, layer_idx=layer_idx)
+        self.attn = GPTBigCodeAttention(config, layer_idx=layer_idx)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
-            self.crossattention = GPT2Attention(config, is_cross_attention=True, layer_idx=layer_idx)
+            self.crossattention = GPTBigCodeAttention(config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
-        self.mlp = GPT2MLP(inner_dim, config)
+        self.mlp = GPTBigCodeMLP(inner_dim, config)
 
     def forward(
         self,
@@ -434,18 +430,18 @@ class GPT2Block(nn.Module):
         return outputs  # hidden_states, present, (attentions, cross_attentions)
 
 
-class GPT2PreTrainedModel(PreTrainedModel):
+class GPTBigCodePreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
     """
 
-    config_class = GPT2Config
-    load_tf_weights = load_tf_weights_in_gpt2
+    config_class = GPTBigCodeConfig
+    load_tf_weights = load_tf_weights_in_gpt_bigcode
     base_model_prefix = "transformer"
     is_parallelizable = True
     supports_gradient_checkpointing = True
-    _no_split_modules = ["GPT2Block"]
+    _no_split_modules = ["GPTBigCodeBlock"]
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
@@ -478,12 +474,12 @@ class GPT2PreTrainedModel(PreTrainedModel):
                 p.data.normal_(mean=0.0, std=(self.config.initializer_range / math.sqrt(2 * self.config.n_layer)))
 
     def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, GPT2Model):
+        if isinstance(module, GPTBigCodeModel):
             module.gradient_checkpointing = value
 
 
 @dataclass
-class GPT2DoubleHeadsModelOutput(ModelOutput):
+class GPTBigCodeDoubleHeadsModelOutput(ModelOutput):
     """
     Base class for outputs of models predicting if two sentences are consecutive or not.
 
@@ -511,7 +507,7 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
             Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
 
-            GPT2Attentions weights after the attention softmax, used to compute the weighted average in the
+            GPTBigCodeAttentions weights after the attention softmax, used to compute the weighted average in the
             self-attention heads.
     """
 
@@ -524,7 +520,7 @@ class GPT2DoubleHeadsModelOutput(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
-GPT2_START_DOCSTRING = r"""
+GPTBigCode_START_DOCSTRING = r"""
 
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -535,12 +531,12 @@ GPT2_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`GPT2Config`]): Model configuration class with all the parameters of the model.
+        config ([`GPTBigCodeConfig`]): Model configuration class with all the parameters of the model.
             Initializing with a config file does not load the weights associated with the model, only the
             configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-GPT2_INPUTS_DOCSTRING = r"""
+GPTBigCode_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
@@ -629,7 +625,7 @@ PARALLELIZE_DOCSTRING = r"""
 
     ```python
     # Here is an example of a device map on a machine with 4 GPUs using gpt2-xl, which has a total of 48 attention modules:
-    model = GPT2LMHeadModel.from_pretrained("gpt2-xl")
+    model = GPTBigCodeLMHeadModel.from_pretrained("gpt2-xl")
     device_map = {
         0: [0, 1, 2, 3, 4, 5, 6, 7, 8],
         1: [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
@@ -646,7 +642,7 @@ DEPARALLELIZE_DOCSTRING = r"""
 
     ```python
     # On a 4 GPU machine with gpt2-large:
-    model = GPT2LMHeadModel.from_pretrained("gpt2-large")
+    model = GPTBigCodeLMHeadModel.from_pretrained("gpt2-large")
     device_map = {
         0: [0, 1, 2, 3, 4, 5, 6, 7],
         1: [8, 9, 10, 11, 12, 13, 14, 15],
@@ -660,10 +656,10 @@ DEPARALLELIZE_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare GPT2 Model transformer outputting raw hidden-states without any specific head on top.",
-    GPT2_START_DOCSTRING,
+    "The bare GPTBigCode Model transformer outputting raw hidden-states without any specific head on top.",
+    GPTBigCode_START_DOCSTRING,
 )
-class GPT2Model(GPT2PreTrainedModel):
+class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = ["attn.masked_bias"]
 
     def __init__(self, config):
@@ -675,7 +671,7 @@ class GPT2Model(GPT2PreTrainedModel):
         self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
-        self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         # Model parallel
@@ -732,7 +728,7 @@ class GPT2Model(GPT2PreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=BaseModelOutputWithPastAndCrossAttentions,
@@ -789,7 +785,7 @@ class GPT2Model(GPT2PreTrainedModel):
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
-        # GPT2Attention mask.
+        # GPTBigCodeAttention mask.
         if attention_mask is not None:
             if batch_size <= 0:
                 raise ValueError("batch_size has to be defined and > 0")
@@ -935,17 +931,17 @@ class GPT2Model(GPT2PreTrainedModel):
 
 @add_start_docstrings(
     """
-    The GPT2 Model transformer with a language modeling head on top (linear layer with weights tied to the input
+    The GPTBigCode Model transformer with a language modeling head on top (linear layer with weights tied to the input
     embeddings).
     """,
-    GPT2_START_DOCSTRING,
+    GPTBigCode_START_DOCSTRING,
 )
-class GPT2LMHeadModel(GPT2PreTrainedModel):
+class GPTBigCodeLMHeadModel(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.transformer = GPT2Model(config)
+        self.transformer = GPTBigCodeModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Model parallel
@@ -1009,7 +1005,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             "token_type_ids": token_type_ids,
         }
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=CausalLMOutputWithCrossAttentions,
@@ -1101,20 +1097,20 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
 @add_start_docstrings(
     """
-The GPT2 Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
+The GPTBigCode Model transformer with a language modeling and a multiple-choice classification head on top e.g. for
 RocStories/SWAG tasks. The two heads are two linear layers. The language modeling head has its weights tied to the
 input embeddings, the classification head takes as input the input of a specified classification token index in the
 input sequence).
 """,
-    GPT2_START_DOCSTRING,
+    GPTBigCode_START_DOCSTRING,
 )
-class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
+class GPTBigCodeDoubleHeadsModel(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
         config.num_labels = 1
-        self.transformer = GPT2Model(config)
+        self.transformer = GPTBigCodeModel(config)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.multiple_choice_head = SequenceSummary(config)
 
@@ -1182,8 +1178,8 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
             "token_type_ids": token_type_ids,
         }
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=GPT2DoubleHeadsModelOutput, config_class=_CONFIG_FOR_DOC)
+    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=GPTBigCodeDoubleHeadsModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1201,7 +1197,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs,
-    ) -> Union[Tuple, GPT2DoubleHeadsModelOutput]:
+    ) -> Union[Tuple, GPTBigCodeDoubleHeadsModelOutput]:
         r"""
         mc_token_ids (`torch.LongTensor` of shape `(batch_size, num_choices)`, *optional*, default to index of the last token of the input):
             Index of the classification token in each input sequence. Selected in the range `[0, input_ids.size(-1) -
@@ -1220,10 +1216,10 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
 
         ```python
         >>> import torch
-        >>> from transformers import AutoTokenizer, GPT2DoubleHeadsModel
+        >>> from transformers import AutoTokenizer, GPTBigCodeDoubleHeadsModel
 
         >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        >>> model = GPT2DoubleHeadsModel.from_pretrained("gpt2")
+        >>> model = GPTBigCodeDoubleHeadsModel.from_pretrained("gpt2")
 
         >>> # Add a [CLS] to the vocabulary (we should train it also!)
         >>> num_added_tokens = tokenizer.add_special_tokens({"cls_token": "[CLS]"})
@@ -1284,7 +1280,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
                 output = (mc_loss,) + output
             return ((lm_loss,) + output) if lm_loss is not None else output
 
-        return GPT2DoubleHeadsModelOutput(
+        return GPTBigCodeDoubleHeadsModelOutput(
             loss=lm_loss,
             mc_loss=mc_loss,
             logits=lm_logits,
@@ -1309,9 +1305,9 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
 
 @add_start_docstrings(
     """
-    The GPT2 Model transformer with a sequence classification head on top (linear layer).
+    The GPTBigCode Model transformer with a sequence classification head on top (linear layer).
 
-    [`GPT2ForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+    [`GPTBigCodeForSequenceClassification`] uses the last token in order to do the classification, as other causal models
     (e.g. GPT-1) do.
 
     Since it does classification on the last token, it requires to know the position of the last token. If a
@@ -1320,15 +1316,15 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    GPT2_START_DOCSTRING,
+    GPTBigCode_START_DOCSTRING,
 )
-class GPT2ForSequenceClassification(GPT2PreTrainedModel):
+class GPTBigCodeForSequenceClassification(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.masked_bias", r"lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.transformer = GPT2Model(config)
+        self.transformer = GPTBigCodeModel(config)
         self.score = nn.Linear(config.n_embd, self.num_labels, bias=False)
 
         # Model parallel
@@ -1338,7 +1334,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint="microsoft/DialogRPT-updown",
         output_type=SequenceClassifierOutputWithPast,
@@ -1442,17 +1438,17 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
 
 @add_start_docstrings(
     """
-    GPT2 Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g. for
+    GPTBigCode Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g. for
     Named-Entity-Recognition (NER) tasks.
     """,
-    GPT2_START_DOCSTRING,
+    GPTBigCode_START_DOCSTRING,
 )
-class GPT2ForTokenClassification(GPT2PreTrainedModel):
+class GPTBigCodeForTokenClassification(GPTBigCodePreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
 
-        self.transformer = GPT2Model(config)
+        self.transformer = GPTBigCodeModel(config)
         if hasattr(config, "classifier_dropout") and config.classifier_dropout is not None:
             classifier_dropout = config.classifier_dropout
         elif hasattr(config, "hidden_dropout") and config.hidden_dropout is not None:
@@ -1469,7 +1465,7 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
     # fmt: off
     @add_code_sample_docstrings(
         checkpoint="brad1141/gpt2-finetuned-comp2",
