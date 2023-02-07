@@ -18,15 +18,15 @@
 
 from typing import TYPE_CHECKING
 
-from ...utils import (
-    OptionalDependencyNotAvailable,
-    _LazyModule,
-    is_torch_available,
-)
+from ...utils import OptionalDependencyNotAvailable, _LazyModule, is_torch_available
 
 
 _import_structure = {
-    "configuration_gpt_bigcode": ["GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPTBigCodeConfig", "GPTBigCodeOnnxConfig"],
+    "configuration_gpt_bigcode": [
+        "GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP",
+        "GPTBigCodeConfig",
+        "GPTBigCodeOnnxConfig",
+    ],
 }
 
 try:
@@ -47,7 +47,11 @@ else:
     ]
 
 if TYPE_CHECKING:
-    from .configuration_gpt_bigcode import GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP, GPTBigCodeConfig, GPTBigCodeOnnxConfig
+    from .configuration_gpt_bigcode import (
+        GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP,
+        GPTBigCodeConfig,
+        GPTBigCodeOnnxConfig,
+    )
 
     try:
         if not is_torch_available():

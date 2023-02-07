@@ -134,7 +134,8 @@ class GPTBigCodeAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.kv_dim = self.embed_dim if self.attention_type == AttentionType.MULTI_HEAD else self.head_dim
+        self.kv_heads = 1 if self.is_mqa else self.head_dim
+        self.kv_dim = self.kv_heads * self.head_dim
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -149,6 +150,13 @@ class GPTBigCodeAttention(nn.Module):
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
+
+        self.scale_factor = 1.0
+        if self.scale_attn_weights:
+            self.scale_factor /= self.head_dim**0.5
+
+        if self.scale_attn_by_inverse_layer_idx:
+            self.scale_factor /= self.layer_idx + 1
 
         if self.is_cross_attention:
             if self.is_mqa:
@@ -208,16 +216,9 @@ class GPTBigCodeAttention(nn.Module):
         return z.view(output_shape)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None, upcast=False):
-        scale_factor = 1.0
-        if self.scale_attn_weights:
-            scale_factor /= value.size(-1) ** 0.5
-
-        if self.scale_attn_by_inverse_layer_idx:
-            scale_factor /= self.layer_idx + 1
-
         with autocast(enabled=False):
             attn_weights = self._matmul(
-                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else None, scale_factor=scale_factor
+                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else None, scale_factor=self.scale_factor
             )
 
         if not self.is_cross_attention:
@@ -282,7 +283,7 @@ class GPTBigCodeAttention(nn.Module):
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
