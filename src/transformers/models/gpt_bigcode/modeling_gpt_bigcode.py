@@ -520,7 +520,7 @@ class GPTBigCodeDoubleHeadsModelOutput(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
 
 
-GPTBigCode_START_DOCSTRING = r"""
+GPT_BIGCODE_START_DOCSTRING = r"""
 
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
@@ -536,7 +536,7 @@ GPTBigCode_START_DOCSTRING = r"""
             configuration. Check out the [`~PreTrainedModel.from_pretrained`] method to load the model weights.
 """
 
-GPTBigCode_INPUTS_DOCSTRING = r"""
+GPT_BIGCODE_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, input_ids_length)`):
             `input_ids_length` = `sequence_length` if `past_key_values` is `None` else
@@ -657,7 +657,7 @@ DEPARALLELIZE_DOCSTRING = r"""
 
 @add_start_docstrings(
     "The bare GPTBigCode Model transformer outputting raw hidden-states without any specific head on top.",
-    GPTBigCode_START_DOCSTRING,
+    GPT_BIGCODE_START_DOCSTRING,
 )
 class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = ["attn.masked_bias"]
@@ -728,7 +728,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
-    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPT_BIGCODE_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=BaseModelOutputWithPastAndCrossAttentions,
@@ -934,7 +934,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     The GPTBigCode Model transformer with a language modeling head on top (linear layer with weights tied to the input
     embeddings).
     """,
-    GPTBigCode_START_DOCSTRING,
+    GPT_BIGCODE_START_DOCSTRING,
 )
 class GPTBigCodeLMHeadModel(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
@@ -1005,7 +1005,7 @@ class GPTBigCodeLMHeadModel(GPTBigCodePreTrainedModel):
             "token_type_ids": token_type_ids,
         }
 
-    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPT_BIGCODE_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=CausalLMOutputWithCrossAttentions,
@@ -1102,7 +1102,7 @@ RocStories/SWAG tasks. The two heads are two linear layers. The language modelin
 input embeddings, the classification head takes as input the input of a specified classification token index in the
 input sequence).
 """,
-    GPTBigCode_START_DOCSTRING,
+    GPT_BIGCODE_START_DOCSTRING,
 )
 class GPTBigCodeDoubleHeadsModel(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
@@ -1178,7 +1178,7 @@ class GPTBigCodeDoubleHeadsModel(GPTBigCodePreTrainedModel):
             "token_type_ids": token_type_ids,
         }
 
-    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPT_BIGCODE_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=GPTBigCodeDoubleHeadsModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -1316,7 +1316,7 @@ class GPTBigCodeDoubleHeadsModel(GPTBigCodePreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    GPTBigCode_START_DOCSTRING,
+    GPT_BIGCODE_START_DOCSTRING,
 )
 class GPTBigCodeForSequenceClassification(GPTBigCodePreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"h\.\d+\.attn\.masked_bias", r"lm_head.weight"]
@@ -1334,7 +1334,7 @@ class GPTBigCodeForSequenceClassification(GPTBigCodePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPT_BIGCODE_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         checkpoint="microsoft/DialogRPT-updown",
         output_type=SequenceClassifierOutputWithPast,
@@ -1441,7 +1441,7 @@ class GPTBigCodeForSequenceClassification(GPTBigCodePreTrainedModel):
     GPTBigCode Model with a token classification head on top (a linear layer on top of the hidden-states output) e.g. for
     Named-Entity-Recognition (NER) tasks.
     """,
-    GPTBigCode_START_DOCSTRING,
+    GPT_BIGCODE_START_DOCSTRING,
 )
 class GPTBigCodeForTokenClassification(GPTBigCodePreTrainedModel):
     def __init__(self, config):
@@ -1465,7 +1465,7 @@ class GPTBigCodeForTokenClassification(GPTBigCodePreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(GPTBigCode_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(GPT_BIGCODE_INPUTS_DOCSTRING)
     # fmt: off
     @add_code_sample_docstrings(
         checkpoint="brad1141/gpt2-finetuned-comp2",
