@@ -41,7 +41,7 @@ import zipfile
 
 import torch
 
-from transformers import AutoTokenizer, GPTBigCodeConfig, GPTBigCodeModel
+from transformers import GPTBigCodeConfig
 
 
 ####################################################################################################
@@ -110,7 +110,13 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         config.n_layer = ds_args.num_layers
         config.n_head = ds_args.num_attention_heads
         config.n_inner = ds_args.ffn_hidden_size
-        config.attention_type = ds_args.attention_type
+
+        if ds_args.attention_type == "multihead":
+            config.attention_type = 1
+        else:
+            assert ds_args.attention_type == "multiquery"
+            config.attention_type = 2 if args.merge_qkv else 3
+
         # also set `scale_attn_weights` and `scale_attn_by_inverse_layer_idx` ?
         # Uncommenting the next line makes the converted model output different logits.
         # config.scale_attn_by_inverse_layer_idx = ds_args.apply_query_key_layer_scaling
@@ -211,9 +217,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
             output_state_dict[layer_name + ".attn.c_attn.weight"] = out_val
 
         # Tranpose the Q matrix (for MQA)
-        elif (
-                op_name == "self_attention.query"
-        ) and weight_or_bias == "weight":
+        elif (op_name == "self_attention.query") and weight_or_bias == "weight":
             # Insert a tensor of 1x1xDxD bias.
             causal_mask = torch.tril(torch.ones((n_positions, n_positions), dtype=torch.float16)).view(
                 1, 1, n_positions, n_positions
@@ -231,15 +235,20 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
             output_state_dict[layer_name + ".attn.q_attn.weight"] = out_val
 
         # Tranpose the KV matrix (for MQA)
-        elif (
-                op_name == "self_attention.key_value"
-        ) and weight_or_bias == "weight":
+        elif (op_name == "self_attention.key_value") and weight_or_bias == "weight":
             # Key-values are shared across heads
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 2, 1, hidden_size_per_head)
             # Megatron stores (out x in) but transformers-GPT2 expects (in x out).
             out_val = out_val.transpose(0, 1).contiguous()
-            # Store.
-            output_state_dict[layer_name + ".attn.kv_attn.weight"] = out_val
+            if args.merge_qkv:
+                # Concatenate the tensors.
+                # Query is before key_value in the dict.
+                query = output_state_dict.pop(layer_name + ".attn.q_attn.weight")
+                out_val = torch.cat([query, out_val], dim=1)
+                output_state_dict[layer_name + ".attn.c_attn.weight"] = out_val
+            else:
+                # Store.
+                output_state_dict[layer_name + ".attn.kv_attn.weight"] = out_val
 
         # Transpose the bias.
         elif (
@@ -251,22 +260,25 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
             output_state_dict[layer_name + ".attn.c_attn.bias"] = out_val
 
         # Transpose the Q bias (MQA)
-        elif (
-                op_name == "self_attention.query"
-        ) and weight_or_bias == "bias":
+        elif (op_name == "self_attention.query") and weight_or_bias == "bias":
 
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 1, heads, hidden_size_per_head)
             # Store. No change of shape.
             output_state_dict[layer_name + ".attn.q_attn.bias"] = out_val
 
         # Transpose the KV bias (MQA)
-        elif (
-                op_name == "self_attention.key_value"
-        ) and weight_or_bias == "bias":
+        elif (op_name == "self_attention.key_value") and weight_or_bias == "bias":
 
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 2, 1, hidden_size_per_head)
-            # Store. No change of shape.
-            output_state_dict[layer_name + ".attn.kv_attn.bias"] = out_val
+            if args.merge_qkv:
+                # Concatenate the tensors.
+                # Query is before key_value in the dict.
+                query = output_state_dict.pop(layer_name + ".attn.q_attn.bias")
+                out_val = torch.cat([query, out_val], dim=0)
+                output_state_dict[layer_name + ".attn.c_attn.bias"] = out_val
+            else:
+                # Store. No change of shape.
+                output_state_dict[layer_name + ".attn.kv_attn.bias"] = out_val
 
         # Transpose the weights.
         elif weight_or_bias == "weight":
@@ -311,6 +323,12 @@ def main():
         default="",
         type=str,
         help="An optional config json file describing the pre-trained model.",
+    )
+    parser.add_argument(
+        "--no_merge_qkv",
+        dest="merge_qkv",
+        action="store_false",
+        help="Do not merge the query and key_value tensors (MQA)",
     )
     args = parser.parse_args()
 
