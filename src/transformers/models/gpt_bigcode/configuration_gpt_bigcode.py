@@ -201,7 +201,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
 
-class GPT2OnnxConfig(OnnxConfigWithPast):
+class GPTBigCodeOnnxConfig(OnnxConfigWithPast):
     def __init__(
         self,
         config: PretrainedConfig,
