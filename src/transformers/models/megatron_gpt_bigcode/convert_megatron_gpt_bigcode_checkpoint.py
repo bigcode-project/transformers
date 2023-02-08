@@ -41,7 +41,7 @@ import zipfile
 
 import torch
 
-from transformers import GPTBigCodeConfig, GPTBigCodeModel, GPTBigCodeLMHeadModel
+from transformers import GPTBigCodeConfig, GPTBigCodeLMHeadModel, GPTBigCodeModel
 
 
 ####################################################################################################
@@ -314,7 +314,9 @@ def main(argv=None):
         action="store_true",
         help="Save as custom model so it can be used with huggingface transformers.",
     )
-    parser.add_argument("--save_dir", help="Path where the converted model is saved. Will use the checkpoint directory if not provided")
+    parser.add_argument(
+        "--save_dir", help="Path where the converted model is saved. Will use the checkpoint directory if not provided"
+    )
     args = parser.parse_args(argv)
 
     # Extract the basename.

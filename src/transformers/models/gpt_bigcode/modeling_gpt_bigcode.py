@@ -44,6 +44,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+
 from .configuration_gpt_bigcode import AttentionType, GPTBigCodeConfig
 
 
