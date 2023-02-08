@@ -41,7 +41,7 @@ import zipfile
 
 import torch
 
-from transformers import GPTBigCodeConfig
+from transformers import GPTBigCodeConfig, GPTBigCodeModel, GPTBigCodeLMHeadModel
 
 
 ####################################################################################################
@@ -111,10 +111,10 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         config.n_head = ds_args.num_attention_heads
         config.n_inner = ds_args.ffn_hidden_size
 
-        if ds_args.attention_type == "multihead":
+        if ds_args.attention_head_type == "multihead":
             config.attention_type = 1
         else:
-            assert ds_args.attention_type == "multiquery"
+            assert ds_args.attention_head_type == "multiquery"
             config.attention_type = 2 if args.merge_qkv else 3
 
         # also set `scale_attn_weights` and `scale_attn_by_inverse_layer_idx` ?
@@ -199,17 +199,6 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         elif (
             op_name == "attention.query_key_value" or op_name == "self_attention.query_key_value"
         ) and weight_or_bias == "weight":
-
-            # Insert a tensor of 1x1xDxD bias.
-            causal_mask = torch.tril(torch.ones((n_positions, n_positions), dtype=torch.float16)).view(
-                1, 1, n_positions, n_positions
-            )
-            output_state_dict[layer_name + ".attn.bias"] = causal_mask
-
-            # Insert a "dummy" tensor for masked_bias.
-            masked_bias = torch.tensor(-1e4, dtype=torch.float16)
-            output_state_dict[layer_name + ".attn.masked_bias"] = masked_bias
-
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 3, heads, hidden_size_per_head)
             # Megatron stores (3*D) x D but transformers-GPT2 expects D x 3*D.
             out_val = out_val.transpose(0, 1).contiguous()
@@ -218,16 +207,6 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
 
         # Tranpose the Q matrix (for MQA)
         elif (op_name == "self_attention.query") and weight_or_bias == "weight":
-            # Insert a tensor of 1x1xDxD bias.
-            causal_mask = torch.tril(torch.ones((n_positions, n_positions), dtype=torch.float16)).view(
-                1, 1, n_positions, n_positions
-            )
-            output_state_dict[layer_name + ".attn.bias"] = causal_mask
-
-            # Insert a "dummy" tensor for masked_bias.
-            masked_bias = torch.tensor(-1e4, dtype=torch.float16)
-            output_state_dict[layer_name + ".attn.masked_bias"] = masked_bias
-
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 1, heads, hidden_size_per_head)
             # Megatron stores (out x in) but transformers-GPT2 expects (in x out).
             out_val = out_val.transpose(0, 1).contiguous()
@@ -309,7 +288,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
 ####################################################################################################
 
 
-def main():
+def main(argv=None):
     # Create the argument parser.
     parser = argparse.ArgumentParser()
     parser.add_argument("--print-checkpoint-structure", action="store_true")
@@ -328,12 +307,18 @@ def main():
         "--no_merge_qkv",
         dest="merge_qkv",
         action="store_false",
-        help="Do not merge the query and key_value tensors (MQA)",
+        help="Do not merge the query and key_value tensors (MQA).",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--custom_model",
+        action="store_true",
+        help="Save as custom model so it can be used with huggingface transformers.",
+    )
+    parser.add_argument("--save_dir", help="Path where the converted model is saved. Will use the checkpoint directory if not provided")
+    args = parser.parse_args(argv)
 
     # Extract the basename.
-    basename = os.path.dirname(args.path_to_checkpoint)
+    basename = args.save_dir or os.path.dirname(args.path_to_checkpoint)
 
     # Load the model.
     # the .zip is very optional, let's keep it for backward compatibility
@@ -349,9 +334,11 @@ def main():
 
     # Read the config, or default to the model released by NVIDIA.
     if args.config_file == "":
+        # TODO: FP32 softmax
 
         if ds_args is not None:
             if ds_args.bias_gelu_fusion:
+                # TODO: This will be in the next release of transformers (4.27).
                 activation_function = "gelu_pytorch_tanh"
             elif ds_args.openai_gelu:
                 activation_function = "gelu_new"
@@ -415,18 +402,27 @@ def main():
     # tokenizer_class = type(tokenizer).__name__
     # config.tokenizer_class = tokenizer_class
 
-    # Store the config to file.
-    print("Saving config")
-    config.save_pretrained(basename)
+    if args.custom_model:
+        # Save custom model
+        GPTBigCodeConfig.register_for_auto_class()
+        GPTBigCodeModel.register_for_auto_class("AutoModelForCausalLM")
+        hf_model = GPTBigCodeLMHeadModel(config)
+        hf_model.load_state_dict(output_state_dict)
+        hf_model.save_pretrained(basename)
 
-    # Save tokenizer based on args
-    # print(f"Adding {tokenizer_class} tokenizer files")
-    # tokenizer.save_pretrained(basename)
+    else:
+        # Store the config to file.
+        print("Saving config")
+        config.save_pretrained(basename)
 
-    # Store the state_dict to file.
-    output_checkpoint_file = os.path.join(basename, "pytorch_model.bin")
-    print(f'Saving checkpoint to "{output_checkpoint_file}"')
-    torch.save(output_state_dict, output_checkpoint_file)
+        # Save tokenizer based on args
+        # print(f"Adding {tokenizer_class} tokenizer files")
+        # tokenizer.save_pretrained(basename)
+
+        # Store the state_dict to file.
+        output_checkpoint_file = os.path.join(basename, "pytorch_model.bin")
+        print(f'Saving checkpoint to "{output_checkpoint_file}"')
+        torch.save(output_state_dict, output_checkpoint_file)
 
 
 ####################################################################################################
