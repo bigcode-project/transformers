@@ -28,7 +28,9 @@ from ...utils import logging
 logger = logging.get_logger(__name__)
 
 GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    # TODO: Add support for santa models.
+    "bigcode/santacoder-fast-inference": (
+        "https://huggingface.co/bigcode/santacoder-fast-inference/resolve/main/config.json"
+    ),
 }
 
 
