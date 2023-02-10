@@ -55,6 +55,40 @@ GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # TODO: Add support for santa models.
 ]
 
+# Fused kernels
+# Use separate functions for each case because conditionals prevent kernel fusion.
+# TODO: Could have better fused kernels depending on scaling, dropout and head mask.
+#  Is it doable without writing 32 functions?
+
+
+@torch.jit.script
+def upcast_masked_softmax(
+    x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor, scale: float, softmax_dtype: torch.dtype
+):
+    with torch.jit.strict_fusion:
+        input_dtype = x.dtype
+        x = x.to(softmax_dtype) * scale
+        x = torch.where(mask, x, mask_value)
+        x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
+    return x
+
+
+@torch.jit.script
+def upcast_softmax(x: torch.Tensor, scale: float, softmax_dtype: torch.dtype):
+    input_dtype = x.dtype
+    with torch.jit.strict_fusion:
+        x = x.to(softmax_dtype) * scale
+        x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
+    return x
+
+
+@torch.jit.script
+def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor):
+    with torch.jit.strict_fusion:
+        x = torch.where(mask, x, mask_value)
+        x = torch.nn.functional.softmax(x, dim=-1)
+    return x
+
 
 def load_tf_weights_in_gpt_bigcode(model, config, gpt_bigcode_checkpoint_path):
     """Load tf checkpoints in a pytorch model"""
@@ -139,7 +173,6 @@ class GPTBigCodeAttention(nn.Module):
 
         self.layer_idx = layer_idx
         self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
-        # TODO: This is only useful in fp16
         self.scale_attention_softmax_in_fp32 = (
             config.scale_attention_softmax_in_fp32 and config.attention_softmax_in_fp32
         )
@@ -202,29 +235,30 @@ class GPTBigCodeAttention(nn.Module):
         return z.view(output_shape)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        # TODO: Upcast has a big overhead, too many extra kernels. Try fusing?
         dtype = query.dtype
         softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
+        upcast = dtype != softmax_dtype
 
-        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and softmax_dtype != dtype else 1
+        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
         scale_factor = unscale**-1
         if self.scale_attn_weights:
             scale_factor /= self.head_dim**0.5
 
         attn_weights = self._matmul(query, key.transpose(-1, -2), scale_factor=scale_factor)
 
-        # Upcast implicitly in the next op to avoid an extra kernel.
-        if unscale != 1:
-            attn_weights = attn_weights * torch.full([1], unscale, dtype=softmax_dtype, device=attn_weights.device)
-            assert attn_weights.dtype == softmax_dtype
-
-        if attention_mask is not None:
+        if attention_mask is None:
+            if upcast:
+                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
+            else:
+                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        else:
             mask_value = torch.full(
                 [], torch.finfo(attn_weights.dtype).min, dtype=attn_weights.dtype, device=attn_weights.device
             )
-            attn_weights = torch.where(attention_mask, attn_weights.to(dtype=softmax_dtype), mask_value)
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=softmax_dtype).to(query.dtype)
+            if upcast:
+                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
+            else:
+                attn_weights = masked_softmax(attn_weights, attention_mask, mask_value)
 
         attn_weights = self.attn_dropout(attn_weights)
 
