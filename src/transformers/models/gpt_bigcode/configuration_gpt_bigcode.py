@@ -165,7 +165,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         use_cache=True,
         bos_token_id=50256,
         eos_token_id=50256,
-        attention_softmax_in_fp32=False,
+        attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         attention_type=AttentionType.MULTI_HEAD,
         **kwargs,

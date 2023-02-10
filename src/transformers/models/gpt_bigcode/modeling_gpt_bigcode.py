@@ -65,28 +65,25 @@ GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
 def upcast_masked_softmax(
     x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor, scale: float, softmax_dtype: torch.dtype
 ):
-    with torch.jit.strict_fusion:
-        input_dtype = x.dtype
-        x = x.to(softmax_dtype) * scale
-        x = torch.where(mask, x, mask_value)
-        x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
+    input_dtype = x.dtype
+    x = x.to(softmax_dtype) * scale
+    x = torch.where(mask, x, mask_value)
+    x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
     return x
 
 
 @torch.jit.script
 def upcast_softmax(x: torch.Tensor, scale: float, softmax_dtype: torch.dtype):
     input_dtype = x.dtype
-    with torch.jit.strict_fusion:
-        x = x.to(softmax_dtype) * scale
-        x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
+    x = x.to(softmax_dtype) * scale
+    x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
     return x
 
 
 @torch.jit.script
 def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor):
-    with torch.jit.strict_fusion:
-        x = torch.where(mask, x, mask_value)
-        x = torch.nn.functional.softmax(x, dim=-1)
+    x = torch.where(mask, x, mask_value)
+    x = torch.nn.functional.softmax(x, dim=-1)
     return x
 
 
@@ -234,6 +231,12 @@ class GPTBigCodeAttention(nn.Module):
         z = torch.baddbmm(z, x, y, beta=0, alpha=scale_factor)
         return z.view(output_shape)
 
+    def _get_mask_value(self, device, dtype):
+        # torch.where expects a tensor. We use a cache to avoid recreating it every time.
+        if self.mask_value is None or self.mask_value.dtype != dtype or self.mask_value.device != device:
+            self.mask_value = torch.full([], torch.finfo(dtype).min, dtype=dtype, device=device)
+        return self.mask_value
+
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         dtype = query.dtype
         softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
@@ -246,19 +249,19 @@ class GPTBigCodeAttention(nn.Module):
 
         attn_weights = self._matmul(query, key.transpose(-1, -2), scale_factor=scale_factor)
 
-        if attention_mask is None:
-            if upcast:
+        if upcast:
+            # Use a fused kernel to prevent a large overhead from casting and scaling.
+            if attention_mask is None:
                 attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
             else:
-                attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-        else:
-            mask_value = torch.full(
-                [], torch.finfo(attn_weights.dtype).min, dtype=attn_weights.dtype, device=attn_weights.device
-            )
-            if upcast:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
                 attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
-            else:
-                attn_weights = masked_softmax(attn_weights, attention_mask, mask_value)
+        else:
+            if attention_mask is not None:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+                # This can be fused with the softmax, but the fused kernel seems slower.
+                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
         attn_weights = self.attn_dropout(attn_weights)
 
