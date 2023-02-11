@@ -372,13 +372,12 @@ class GPTBigCodeInferenceRunner:
         self.n_layer = len(self.model.h)
 
         self.cuda_graph = config.cuda_graph
-        self.cuda_graphs = None
+        self.validate_input = config.validate_runner_input
+        # TODO: This crashes jit (INTERNAL ASSERT FAILED, can run with PYTORCH_JIT=0)
+        self.full_cuda_graph = self.cuda_graph and config.full_cuda_graph
 
-        # TODO: Allow smaller to avoid OOM
-        self.max_sequence_length = config.n_positions
+        self.max_sequence_length = config.runner_max_sequence_length or config.n_positions
         # self.max_batch_size=None
-        self.device = None
-        self.dtype = None
 
     def _allocate(self, batch_size, device, dtype):
         block: GPTBigCodeBlock = self.model.h[0]
@@ -388,6 +387,14 @@ class GPTBigCodeInferenceRunner:
         self.batch_size = batch_size
         self.dtype = dtype
         self.device = device
+        self.softmax_dtype = torch.float32 if attn.attention_softmax_in_fp32 else self.dtype
+        self.upcast = self.softmax_dtype != self.dtype
+
+        do_unscale = attn.scale_attention_softmax_in_fp32 and self.upcast
+        self.unscale = [i + 1.0 if do_unscale else 1.0 for i in range(self.n_layer)]
+        scale = attn.head_dim**-0.5 if attn.scale_attn_weights else 1
+        self.scale = [scale / unscale for unscale in self.unscale]
+
         factory_kwargs = {"device": self.device, "dtype": self.dtype}
 
         hidden_end = attn.embed_dim
@@ -407,6 +414,11 @@ class GPTBigCodeInferenceRunner:
             (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim),
             **factory_kwargs,
         )
+        self.mask_value = torch.full(
+            [], torch.finfo(self.softmax_dtype).min, dtype=self.softmax_dtype, device=self.device
+        )
+        attn_mask = torch.empty((self.batch_size, 1, self.max_sequence_length), dtype=torch.bool, device=self.device)
+        self.attn_masks = [attn_mask[:, :, :key_length] for key_length in range(self.max_sequence_length)]
 
         # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
         self.hidden_states_squeezed = activation_pool[:, :hidden_end]
@@ -444,27 +456,50 @@ class GPTBigCodeInferenceRunner:
         self.c_proj = activation_pool[:, query_end:c_proj_end]
 
         # MLP first layer: (batch_size, embed_dim)
-        self.mlp_c_fc = activation_pool[:, hidden_end:query_end]
+        self.mlp_c_fc = activation_pool[:, hidden_end:c_fc_end]
         # MLP projection: (batch_size, inner_dim)
-        self.mlp_c_proj = activation_pool[:, hidden_end:c_fc_end]
+        self.mlp_c_proj = activation_pool[:, hidden_end:query_end]
 
-        self._generate_cuda_graphs()
+        if self.cuda_graph:
+            self.memory_pool = None
+            if self.full_cuda_graph:
+                self.cuda_graphs = {}
+                # The output may not always be at the same memory location.
+                self.output_hidden_states = {}
+                # Generate the largest one first to warm up the memory pool.
+                # The other ones are generated lazily.
+                self._generate_full_cuda_graph(self.max_sequence_length)
+            else:
+                self._generate_cuda_graphs()
 
     def _generate_cuda_graphs(self):
-        memory_pool = None
-        self.cuda_graphs = []
+        self.cuda_graphs = {}
+        print(f"Generating cuda graphs")
         for layer_idx in range(self.n_layer + 1):
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=memory_pool):
+            with torch.cuda.graph(graph, pool=self.memory_pool):
                 if layer_idx > 0:
                     self._forward_post_attn(self.model.h[layer_idx - 1])
                 if layer_idx < self.n_layer:
                     self._forward_qkv(self.model.h[layer_idx])
                 else:
                     self.output_hidden_states = self._forward_end()
-            if memory_pool is None:
-                memory_pool = graph.pool()
-            self.cuda_graphs.append(graph)
+            if self.memory_pool is None:
+                self.memory_pool = graph.pool()
+            self.cuda_graphs[layer_idx] = graph
+
+    def _generate_full_cuda_graph(self, key_length):
+        print(f"Generating cuda graph for key length {key_length}")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.memory_pool):
+            for block in self.model.h:
+                self._forward_qkv(block)
+                self._forward_attn(block, key_length)
+                self._forward_post_attn(block)
+            self.output_hidden_states[key_length] = self._forward_end()
+        if self.memory_pool is None:
+            self.memory_pool = graph.pool()
+        self.cuda_graphs[key_length] = graph
 
     def _forward_embed(self, input_ids, position_ids):
         # Embedding doesn't support out argument.
@@ -482,21 +517,29 @@ class GPTBigCodeInferenceRunner:
             out=self.c_attn,
         )
 
-    def _forward_attn(self, block, attention_mask, key_length):
-        self.kv_caches_unbound[block.attn.layer_idx][key_length - 1].copy_(self.kv_attn)
-        key, value = self.keys_values[block.attn.layer_idx][key_length]
+    def _forward_attn(self, block, key_length):
+        layer_idx = block.attn.layer_idx
+        self.kv_caches_unbound[layer_idx][key_length - 1].copy_(self.kv_attn)
+        key, value = self.keys_values[layer_idx][key_length]
         attn_weights = self.attn_weights[key_length]
         torch.baddbmm(
             attn_weights,
             self.query,
             key,
             beta=0,
-            alpha=block.attn.scale_factor,
+            alpha=self.scale[layer_idx],
         )
-        # Causal mask is identity.
-        # Ops are safe to do inplace.
-        attn_weights.add_(attention_mask.squeeze(2))
-        torch.softmax(attn_weights, dim=-1, out=attn_weights)
+        if self.upcast:
+            # Use a fused kernel to prevent a large overhead from casting and scaling.
+            # Jit doesn't allow inplace kernel.
+            attn_weights = upcast_masked_softmax(
+                attn_weights, self.attn_masks[key_length], self.mask_value, self.unscale[layer_idx], self.softmax_dtype
+            )
+        else:
+            # This can be fused, but the fused kernel seems slower.
+            torch.where(self.attn_masks[key_length], attn_weights, self.mask_value, out=attn_weights)
+            torch.softmax(attn_weights, dim=-1, out=attn_weights)
+
         torch.bmm(attn_weights, value, out=self.attn_output_expanded)
         return key, value
 
@@ -522,7 +565,6 @@ class GPTBigCodeInferenceRunner:
     def forward(
         self,
         input_ids: torch.LongTensor,
-        past_key_values: Union[Tuple[Tuple[torch.Tensor, torch.Tensor]], int],
         attention_mask: torch.FloatTensor,
         position_ids: torch.LongTensor,
     ) -> BaseModelOutputWithPastAndCrossAttentions:
@@ -530,37 +572,39 @@ class GPTBigCodeInferenceRunner:
         assert query_length == 1
         if self.batch_size is None:
             self._allocate(batch_size, device=input_ids.device, dtype=self.model.dtype)
-        else:
+        elif self.validate_input:
             assert batch_size == self.batch_size
+            assert self.dtype == self.model.dtype
+            assert self.device == input_ids.device
 
-        assert attention_mask.device == self.device
-        attention_mask = (1.0 - attention_mask[:, None, :].to(dtype=self.dtype, device=self.device)) * torch.finfo(
-            self.dtype
-        ).min
+        if self.validate_input:
+            assert attention_mask.dim() == 2
+            assert attention_mask.shape[0] == batch_size
+            key_length = attention_mask.shape[1]
+            assert key_length <= self.max_sequence_length
+        else:
+            key_length = attention_mask.shape[1]
+
+        # Copy gives a fixed position and replaces conversion to bool.
+        self.attn_masks[key_length].copy_(attention_mask.unsqueeze(1))
 
         self._forward_embed(input_ids, position_ids)
 
-        if isinstance(past_key_values, int):
-            past_key_length = past_key_values
-        else:
-            past_key_length = past_key_values[0][0].shape[-2]
-            for layer_idx, (key, value) in enumerate(past_key_values):
-                key_, value_ = self.keys_values[layer_idx][past_key_length]
-                key_.copy_(key.transpose(-1, -2))
-                value_.copy_(value)
-
-        key_length = past_key_length + 1
-
-        if self.cuda_graph:
+        if self.full_cuda_graph:
+            if key_length not in self.cuda_graphs:
+                self._generate_full_cuda_graph(key_length)
+            self.cuda_graphs[key_length].replay()
+            hidden_states = self.output_hidden_states[key_length]
+        elif self.cuda_graph:
             for i, block in enumerate(self.model.h):
                 self.cuda_graphs[i].replay()
-                self._forward_attn(block, attention_mask, key_length)
+                self._forward_attn(block, key_length)
             self.cuda_graphs[self.n_layer].replay()
             hidden_states = self.output_hidden_states
         else:
             for block in self.model.h:
                 self._forward_qkv(block)
-                self._forward_attn(block, attention_mask, key_length)
+                self._forward_attn(block, key_length)
                 self._forward_post_attn(block)
             hidden_states = self._forward_end()
 
@@ -896,7 +940,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.inference_runner = GPTBigCodeInferenceRunner(config, self) if config.inference_runner else None
-        
+
         max_positions = config.max_position_embeddings
         self.register_buffer(
             "bias", torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)), persistent=False
@@ -979,20 +1023,29 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
         if self.inference_runner is not None and past_key_values is not None:
-            assert input_ids is not None
-            assert past_key_values is not None
-            assert attention_mask is not None
-            assert token_type_ids is None
-            assert position_ids is not None
-            assert head_mask is None
-            assert inputs_embeds is None
-            assert encoder_hidden_states is None
-            assert encoder_attention_mask is None
-            assert use_cache is None
-            assert not output_attentions
-            assert not output_hidden_states
-            assert return_dict
-            return self.inference_runner.forward(input_ids, past_key_values, attention_mask, position_ids)
+            if self.config.validate_runner_input:
+                assert input_ids is not None
+                assert past_key_values is not None
+                assert attention_mask is not None
+                assert token_type_ids is None
+                assert position_ids is not None
+                assert head_mask is None
+                assert inputs_embeds is None
+                assert encoder_hidden_states is None
+                assert encoder_attention_mask is None
+                use_cache = use_cache if use_cache is not None else self.config.use_cache
+                assert use_cache is True
+                output_attentions = (
+                    output_attentions if output_attentions is not None else self.config.output_attentions
+                )
+                assert output_attentions is False
+                output_hidden_states = (
+                    output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+                )
+                assert output_hidden_states is False
+                return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+                assert return_dict is True
+            return self.inference_runner.forward(input_ids, attention_mask, position_ids)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states

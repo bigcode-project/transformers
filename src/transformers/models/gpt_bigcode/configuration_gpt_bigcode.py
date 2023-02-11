@@ -169,7 +169,10 @@ class GPTBigCodeConfig(PretrainedConfig):
         scale_attention_softmax_in_fp32=True,
         attention_type=AttentionType.MULTI_HEAD,
         inference_runner=False,
+        validate_runner_input=True,
         cuda_graph=False,
+        full_cuda_graph=False,
+        runner_max_sequence_length=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -201,7 +204,16 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.attention_type = AttentionType(attention_type).value
 
         self.inference_runner = inference_runner
+        # Set to False to disable input validation of safe inputs, for a small speedup.
+        self.validate_runner_input = validate_runner_input
+        # Use cuda graphs in the inference runner. Leave out the attention which has a variable shape.
+        # This significantly lowers the cpu time and prevent a cpu bottleneck for smaller batches and models.
         self.cuda_graph = cuda_graph
+        # Turn the whole model into a cuda graph. One graph for each sequence length. Only used if cuda_graph==True.
+        # Note: only useful for tiny batches and models, graphs take some time to generate, flaky
+        self.full_cuda_graph = full_cuda_graph
+        # Set if `n_positions` uses too much memory.
+        self.runner_max_sequence_length = runner_max_sequence_length
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
