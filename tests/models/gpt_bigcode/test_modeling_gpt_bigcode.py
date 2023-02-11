@@ -32,11 +32,19 @@ if is_torch_available():
     from transformers import (
         GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST,
         GPT2Tokenizer,
+        GPTBigCodeConfig,
         GPTBigCodeDoubleHeadsModel,
         GPTBigCodeForSequenceClassification,
         GPTBigCodeForTokenClassification,
         GPTBigCodeLMHeadModel,
         GPTBigCodeModel,
+    )
+
+    from transformers.models.gpt_bigcode.configuration_gpt_bigcode import (
+        AttentionType
+    )
+    from transformers.models.gpt_bigcode.modeling_gpt_bigcode import (
+        GPTBigCodeAttention
     )
 
 
@@ -807,3 +815,79 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
                 "but said in a statement to The Associated Press that"
             ],
         )
+
+@require_torch
+class GPTBigCodeAttentionTest(unittest.TestCase):
+    def get_attention(self, attention_type : AttentionType):
+        config = GPTBigCodeConfig.from_pretrained("bigcode/santacoder-fast-inference")
+        config.attention_type = attention_type
+        return GPTBigCodeAttention(config)
+
+    def test_mqa_correctness(self):
+        embed_dim = 2048
+        head_dim = 128
+        random_attn_weight = torch.randn(embed_dim, embed_dim)
+        random_attn_k_weight = torch.randn(embed_dim, head_dim)
+        random_attn_v_weight = torch.randn(embed_dim, head_dim)
+        random_attn_bias = torch.randn(embed_dim)
+        random_attn_k_bias = torch.randn(head_dim)
+        random_attn_v_bias = torch.randn(head_dim)
+        random_proj = torch.randn(embed_dim, embed_dim)
+        random_proj_bias = torch.randn(embed_dim)
+
+        # MULTI-HEAD ATTENTION
+        num_heads = 16
+        c_attn_weight = torch.hstack(
+            [random_attn_weight] + 
+            num_heads * [random_attn_k_weight] +
+            num_heads * [random_attn_v_weight])
+
+        c_attn_bias = torch.hstack(
+            [random_attn_bias] + 
+            num_heads * [random_attn_k_bias] +
+            num_heads * [random_attn_v_bias])
+
+        attention_mh = self.get_attention(AttentionType.MULTI_HEAD)
+        state_dict = attention_mh.state_dict()
+        state_dict["c_attn.weight"] = c_attn_weight
+        state_dict["c_attn.bias"] = c_attn_bias
+        state_dict["c_proj.weight"] = random_proj
+        state_dict["c_proj.bias"] = random_proj_bias
+        attention_mh.load_state_dict(state_dict)
+
+        # MULTI-QUERY ATTENTION 1
+        attention_mq1 = self.get_attention(AttentionType.MULTI_QUERY_1)
+        state_dict_mq1 = attention_mq1.state_dict()
+        c_attn_weight = torch.hstack([random_attn_weight, random_attn_k_weight, random_attn_v_weight])
+        c_attn_bias = torch.hstack([random_attn_bias, random_attn_k_bias, random_attn_v_bias])
+        state_dict_mq1["c_attn.weight"] = c_attn_weight
+        state_dict_mq1["c_attn.bias"] = c_attn_bias
+        state_dict_mq1["c_proj.weight"] = random_proj
+        state_dict_mq1["c_proj.bias"] = random_proj_bias 
+        attention_mq1.load_state_dict(state_dict_mq1)
+
+        # MULTI-QUERY ATTENTION 2
+        attention_mq2 = self.get_attention(AttentionType.MULTI_QUERY_2)
+        state_dict_mq2 = attention_mq2.state_dict()
+        state_dict_mq2["q_attn.weight"] = random_attn_weight
+        state_dict_mq2["q_attn.bias"] = random_attn_bias
+        state_dict_mq2["kv_attn.weight"] = torch.hstack([random_attn_k_weight, random_attn_v_weight])
+        state_dict_mq2["kv_attn.bias"] = torch.hstack([random_attn_k_bias, random_attn_v_bias])
+        state_dict_mq2["c_proj.weight"] = random_proj
+        state_dict_mq2["c_proj.bias"] = random_proj_bias
+        attention_mq2.load_state_dict(state_dict_mq2)
+
+        # Run correctness test
+        attention_mh.eval()
+        attention_mq1.eval()
+        attention_mq2.eval()
+
+        num_tokens = 5
+        hidden_states = torch.randn(1, num_tokens, embed_dim)
+        attention_mh_result = attention_mh(hidden_states)[0]
+        attention_mq1_result = attention_mq1(hidden_states)[0]
+        attention_mq2_result = attention_mq2(hidden_states)[0]
+
+        self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result))
+        self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result))
+        self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result))

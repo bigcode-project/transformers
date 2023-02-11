@@ -134,7 +134,7 @@ class GPTBigCodeAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.kv_heads = 1 if self.is_mqa else self.head_dim
+        self.kv_heads = 1 if self.is_mqa else self.num_heads
         self.kv_dim = self.kv_heads * self.head_dim
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
