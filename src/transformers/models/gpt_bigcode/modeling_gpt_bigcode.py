@@ -25,16 +25,16 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...modeling_outputs import (
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from ...modeling_utils import PreTrainedModel, SequenceSummary
-from ...pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
-from ...utils import (
+from transformers.modeling_utils import PreTrainedModel, SequenceSummary
+from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
+from transformers.utils import (
     ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
@@ -42,7 +42,8 @@ from ...utils import (
     logging,
     replace_return_docstrings,
 )
-from ...utils.model_parallel_utils import assert_device_map, get_device_map
+from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
+
 from .configuration_gpt_bigcode import AttentionType, GPTBigCodeConfig
 
 
