@@ -419,7 +419,7 @@ class GPTBigCodeInferenceRunner:
             [], torch.finfo(self.softmax_dtype).min, dtype=self.softmax_dtype, device=self.device
         )
         attn_mask = torch.empty((self.batch_size, 1, self.max_sequence_length), dtype=torch.bool, device=self.device)
-        self.attn_masks = [attn_mask[:, :, :key_length] for key_length in range(self.max_sequence_length)]
+        self.attn_masks = [attn_mask[:, :, :key_length] for key_length in range(self.max_sequence_length+1)]
 
         # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
         self.hidden_states_squeezed = activation_pool[:, :hidden_end]
@@ -439,7 +439,7 @@ class GPTBigCodeInferenceRunner:
         self.keys_values = [
             [
                 (key[layer_idx, :, head_slice, :, :key_length], value[layer_idx, :, head_slice, :key_length, :])
-                for key_length in range(self.max_sequence_length)
+                for key_length in range(self.max_sequence_length+1)
             ]
             for layer_idx in range(self.n_layer)
         ]
@@ -448,7 +448,7 @@ class GPTBigCodeInferenceRunner:
         attn_weights = activation_pool[:, kv_end:attn_weights_end].view(
             self.batch_size, attn.num_heads, self.max_sequence_length
         )
-        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length)]
+        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length+1)]
 
         # Attn outputs: (batch_size, embed_dim), no overlap with value.
         self.attn_output = activation_pool[:, hidden_end:query_end]
