@@ -164,8 +164,8 @@ class GPTBigCodeConfig(PretrainedConfig):
         use_cache=True,
         bos_token_id=50256,
         eos_token_id=50256,
-        scale_attn_by_inverse_layer_idx=False,
-        reorder_and_upcast_attn=False,
+        attention_softmax_in_fp32=True,
+        scale_attention_softmax_in_fp32=True,
         attention_type=AttentionType.MULTI_HEAD,
         **kwargs,
     ):
@@ -188,8 +188,8 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.summary_proj_to_labels = summary_proj_to_labels
         self.scale_attn_weights = scale_attn_weights
         self.use_cache = use_cache
-        self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
-        self.reorder_and_upcast_attn = reorder_and_upcast_attn
+        self.attention_softmax_in_fp32 = attention_softmax_in_fp32
+        self.scale_attention_softmax_in_fp32 = scale_attention_softmax_in_fp32
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id

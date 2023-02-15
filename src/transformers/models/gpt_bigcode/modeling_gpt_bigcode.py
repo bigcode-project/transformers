@@ -23,7 +23,6 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
-from torch.cuda.amp import autocast
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
@@ -56,6 +55,37 @@ _CONFIG_FOR_DOC = "GPTBigCodeConfig"
 GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # TODO: Add support for santa models.
 ]
+
+# Fused kernels
+# Use separate functions for each case because conditionals prevent kernel fusion.
+# TODO: Could have better fused kernels depending on scaling, dropout and head mask.
+#  Is it doable without writing 32 functions?
+
+
+@torch.jit.script
+def upcast_masked_softmax(
+    x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor, scale: float, softmax_dtype: torch.dtype
+):
+    input_dtype = x.dtype
+    x = x.to(softmax_dtype) * scale
+    x = torch.where(mask, x, mask_value)
+    x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
+    return x
+
+
+@torch.jit.script
+def upcast_softmax(x: torch.Tensor, scale: float, softmax_dtype: torch.dtype):
+    input_dtype = x.dtype
+    x = x.to(softmax_dtype) * scale
+    x = torch.nn.functional.softmax(x, dim=-1).to(input_dtype)
+    return x
+
+
+@torch.jit.script
+def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor):
+    x = torch.where(mask, x, mask_value)
+    x = torch.nn.functional.softmax(x, dim=-1)
+    return x
 
 
 def load_tf_weights_in_gpt_bigcode(model, config, gpt_bigcode_checkpoint_path):
@@ -119,14 +149,6 @@ def load_tf_weights_in_gpt_bigcode(model, config, gpt_bigcode_checkpoint_path):
 class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
-
-        max_positions = config.max_position_embeddings
-        self.register_buffer(
-            "bias", torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)), persistent=False
-        )
-        self.register_buffer("masked_bias", torch.tensor(-1e4), persistent=False)
-        # We don't use a buffer because the mask value depends on the dtype,
-        # And the dtype will be different if upcasting.
         self.mask_value = None
 
         self.attention_type = AttentionType(config.attention_type)
@@ -147,17 +169,11 @@ class GPTBigCodeAttention(nn.Module):
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
 
-        # Layer-wise attention scaling, reordering, and upcasting
-        self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
         self.layer_idx = layer_idx
-        self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
-
-        self.scale_factor = 1.0
-        if self.scale_attn_weights:
-            self.scale_factor /= self.head_dim**0.5
-
-        if self.scale_attn_by_inverse_layer_idx:
-            self.scale_factor /= self.layer_idx + 1
+        self.attention_softmax_in_fp32 = config.attention_softmax_in_fp32
+        self.scale_attention_softmax_in_fp32 = (
+            config.scale_attention_softmax_in_fp32 and config.attention_softmax_in_fp32
+        )
 
         if self.is_cross_attention:
             if self.is_mqa:
@@ -216,42 +232,38 @@ class GPTBigCodeAttention(nn.Module):
         z = torch.baddbmm(z, x, y, beta=0, alpha=scale_factor)
         return z.view(output_shape)
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None, upcast=False):
-        with autocast(enabled=False):
-            attn_weights = self._matmul(
-                query, key.transpose(-1, -2), dtype=torch.float32 if upcast else None, scale_factor=self.scale_factor
-            )
+    def _get_mask_value(self, device, dtype):
+        # torch.where expects a tensor. We use a cache to avoid recreating it every time.
+        if self.mask_value is None or self.mask_value.dtype != dtype or self.mask_value.device != device:
+            self.mask_value = torch.full([], torch.finfo(dtype).min, dtype=dtype, device=device)
+        return self.mask_value
 
-        if not self.is_cross_attention:
-            # if only "normal" attention layer implements causal mask
-            key_length = key.size(-2)
-            if self.is_mqa:
-                # (b, sq, nh, sk)
-                causal_mask = self.bias[None, key_length - query.size(1) : key_length, None, :key_length]
+    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+        dtype = query.dtype
+        softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
+        upcast = dtype != softmax_dtype
+
+        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
+        scale_factor = unscale**-1
+        if self.scale_attn_weights:
+            scale_factor /= self.head_dim**0.5
+
+        attn_weights = self._matmul(query, key.transpose(-1, -2), scale_factor=scale_factor)
+
+        if upcast:
+            # Use a fused kernel to prevent a large overhead from casting and scaling.
+            if attention_mask is None:
+                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
             else:
-                # (b, nh, sq, sk)
-                causal_mask = self.bias[None, None, key_length - query.size(-2) : key_length, :key_length]
-            # torch.where expects a tensor. We use a cache to avoid recreating it every time.
-            if (
-                self.mask_value is None
-                or self.mask_value.dtype != attn_weights.dtype
-                or self.mask_value.device != attn_weights.device
-            ):
-                self.mask_value = torch.full(
-                    [], torch.finfo(attn_weights.dtype).min, dtype=attn_weights.dtype, device=attn_weights.device
-                )
-            attn_weights = torch.where(causal_mask, attn_weights, self.mask_value)
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
+        else:
+            if attention_mask is not None:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+                # This can be fused with the softmax, but the fused kernel seems slower.
+                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-
-        # Downcast (if necessary) back to V's dtype (if in mixed-precision) -- No-Op otherwise
-        if upcast and attn_weights.dtype != torch.float32:
-            raise RuntimeError("Error with upcasting, attn_weights does not have dtype torch.float32")
-        attn_weights = attn_weights.type(value.dtype)
         attn_weights = self.attn_dropout(attn_weights)
 
         # Mask heads if we want to
@@ -324,9 +336,7 @@ class GPTBigCodeAttention(nn.Module):
         else:
             present = None
 
-        attn_output, attn_weights = self._attn(
-            query, key, value, attention_mask, head_mask, upcast=self.reorder_and_upcast_attn
-        )
+        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim, permute=not self.is_mqa)
         attn_output = self.c_proj(attn_output)
@@ -670,7 +680,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-
+        self.attention_type = AttentionType(config.attention_type)
+        self.is_mqa = self.attention_type != AttentionType.MULTI_HEAD
         self.embed_dim = config.hidden_size
 
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
@@ -679,6 +690,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+
+        max_positions = config.max_position_embeddings
+        self.register_buffer(
+            "bias", torch.tril(torch.ones((max_positions, max_positions), dtype=torch.bool)), persistent=False
+        )
 
         # Model parallel
         self.model_parallel = False
@@ -775,6 +791,9 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
+        if batch_size <= 0:
+            raise ValueError("batch_size has to be defined and > 0")
+
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
         if token_type_ids is not None:
@@ -791,34 +810,28 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
-        # GPTBigCodeAttention mask.
-        if attention_mask is not None:
-            if batch_size <= 0:
-                raise ValueError("batch_size has to be defined and > 0")
-            attention_mask = attention_mask.view(batch_size, -1)
-            # We create a 3D attention mask from a 2D tensor mask.
-            # Sizes are [batch_size, 1, 1, to_seq_length]
-            # So we can broadcast to [batch_size, num_heads, from_seq_length, to_seq_length]
-            # this attention mask is more simple than the triangular masking of causal attention
-            # used in OpenAI GPT, we just need to prepare the broadcast dimension here.
-            attention_mask = attention_mask[:, None, None, :]
+        # Self-attention mask.
+        query_length = input_shape[-1]
+        key_length = past_length + query_length
+        self_attention_mask = self.bias[None, key_length - query_length : key_length, :key_length]
 
-            # Since attention_mask is 1.0 for positions we want to attend and 0.0 for
-            # masked positions, this operation will create a tensor which is 0.0 for
-            # positions we want to attend and the dtype's smallest value for masked positions.
-            # Since we are adding it to the raw scores before the softmax, this is
-            # effectively the same as removing these entirely.
-            attention_mask = attention_mask.to(dtype=self.dtype)  # fp16 compatibility
-            attention_mask = (1.0 - attention_mask) * torch.finfo(self.dtype).min
+        if attention_mask is not None:
+            self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).bool()
+        # MQA: (b, sq, nh, sk)
+        # MHA: (b, nh, sq, sk)
+        attention_mask = self_attention_mask.unsqueeze(2 if self.is_mqa else 1)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.add_cross_attention and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-            encoder_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        if (
+            self.config.add_cross_attention
+            and encoder_hidden_states is not None
+            and encoder_attention_mask is not None
+        ):
+            if encoder_attention_mask.dim() == 2:
+                encoder_attention_mask.unsqueeze(1)
+            assert encoder_attention_mask.dim() == 3
+            encoder_attention_mask = encoder_attention_mask.bool().unsqueeze(2 if self.is_mqa else 1)
         else:
             encoder_attention_mask = None
 
