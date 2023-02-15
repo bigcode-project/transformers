@@ -157,7 +157,7 @@ class GPTBigCodeAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.kv_heads = 1 if self.is_mqa else self.head_dim
+        self.kv_heads = 1 if self.is_mqa else self.num_heads
         self.kv_dim = self.kv_heads * self.head_dim
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
@@ -529,6 +529,7 @@ class GPTBigCodeInferenceRunner:
             key,
             beta=0,
             alpha=self.scale[layer_idx],
+            out=attn_weights,
         )
         if self.upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
@@ -552,12 +553,13 @@ class GPTBigCodeInferenceRunner:
             out=self.c_proj,
         )
         self.hidden_states_squeezed.add_(self.c_proj)
-
-        torch.addmm(block.mlp.c_fc.bias, self.hidden_states_squeezed, block.mlp.c_fc.weight, out=self.mlp_c_fc)
+        # LN doesn't support out argument.
+        hidden_states = block.ln_2(self.hidden_states_squeezed)
+        torch.addmm(block.mlp.c_fc.bias, hidden_states, block.mlp.c_fc.weight, out=self.mlp_c_fc)
         # Most activations don't support out argument.
         feed_forward_hidden_states = block.mlp.act(self.mlp_c_fc)
         torch.addmm(block.mlp.c_proj.bias, feed_forward_hidden_states, block.mlp.c_proj.weight, out=self.mlp_c_proj)
-        self.hidden_states_squeezed.add_(self.c_proj)
+        self.hidden_states_squeezed.add_(self.mlp_c_proj)
 
     def _forward_end(self):
         # LN doesn't support out argument.
@@ -568,6 +570,7 @@ class GPTBigCodeInferenceRunner:
         input_ids: torch.LongTensor,
         attention_mask: torch.FloatTensor,
         position_ids: torch.LongTensor,
+        past_key_values: Union[Tuple[Tuple[torch.Tensor, torch.Tensor], ...], int],
     ) -> BaseModelOutputWithPastAndCrossAttentions:
         batch_size, query_length = input_ids.shape
         assert query_length == 1
@@ -583,8 +586,17 @@ class GPTBigCodeInferenceRunner:
             assert attention_mask.shape[0] == batch_size
             key_length = attention_mask.shape[1]
             assert key_length <= self.max_sequence_length
+            if isinstance(past_key_values, int):
+                assert key_length == past_key_values + 1
         else:
             key_length = attention_mask.shape[1]
+
+        if not isinstance(past_key_values, int):
+            # TODO: This could be improved.
+            for layer_idx, (key, value) in enumerate(past_key_values):
+                key_buf, value_buf = self.keys_values[layer_idx][key_length - 1]
+                key_buf.copy_(key.transpose(-1, -2))
+                value_buf.copy_(value)
 
         # Copy gives a fixed position and replaces conversion to bool.
         self.attn_masks[key_length].copy_(attention_mask.unsqueeze(1))
@@ -1010,7 +1022,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Tuple[Tuple[torch.Tensor, torch.Tensor]], int]] = None,
+        past_key_values: Optional[Union[Tuple[Tuple[torch.Tensor, torch.Tensor], ...], int]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1046,7 +1058,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 assert output_hidden_states is False
                 return_dict = return_dict if return_dict is not None else self.config.use_return_dict
                 assert return_dict is True
-            return self.inference_runner.forward(input_ids, attention_mask, position_ids)
+            return self.inference_runner.forward(input_ids, attention_mask, position_ids, past_key_values)
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
