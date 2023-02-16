@@ -44,7 +44,7 @@ from transformers.utils import (
 )
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 
-from .configuration_gpt_bigcode import AttentionType, GPTBigCodeConfig
+from .configuration_gpt_bigcode import AttentionType, GPTBigCodeConfig, InferenceRunnerType
 
 
 logger = logging.get_logger(__name__)
@@ -372,10 +372,9 @@ class GPTBigCodeInferenceRunner:
         self.model = model
         self.n_layer = len(self.model.h)
 
-        self.cuda_graph = config.cuda_graph
+        self.inference_runner_type = InferenceRunnerType(config.inference_runner)
+        assert self.inference_runner_type != InferenceRunnerType.NO_RUNNER
         self.validate_input = config.validate_runner_input
-        # TODO: This crashes jit (INTERNAL ASSERT FAILED, can run with PYTORCH_JIT=0)
-        self.full_cuda_graph = self.cuda_graph and config.full_cuda_graph
 
         self.max_sequence_length = config.runner_max_sequence_length or config.n_positions
         # self.max_batch_size=None
@@ -461,9 +460,9 @@ class GPTBigCodeInferenceRunner:
         # MLP projection: (batch_size, inner_dim)
         self.mlp_c_proj = activation_pool[:, hidden_end:query_end]
 
-        if self.cuda_graph:
+        if self.inference_runner_type != InferenceRunnerType.BASE_RUNNER:
             self.memory_pool = None
-            if self.full_cuda_graph:
+            if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
                 self.cuda_graphs = {}
                 # The output may not always be at the same memory location.
                 self.output_hidden_states = {}
@@ -603,12 +602,13 @@ class GPTBigCodeInferenceRunner:
 
         self._forward_embed(input_ids, position_ids)
 
-        if self.full_cuda_graph:
+        if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
+            # TODO: This crashes jit (INTERNAL ASSERT FAILED, can run with PYTORCH_JIT=0)
             if key_length not in self.cuda_graphs:
                 self._generate_full_cuda_graph(key_length)
             self.cuda_graphs[key_length].replay()
             hidden_states = self.output_hidden_states[key_length]
-        elif self.cuda_graph:
+        elif self.inference_runner_type == InferenceRunnerType.PARTIAL_GRAPH:
             for i, block in enumerate(self.model.h):
                 self.cuda_graphs[i].replay()
                 self._forward_attn(block, key_length)
@@ -952,7 +952,12 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
-        self.inference_runner = GPTBigCodeInferenceRunner(config, self) if config.inference_runner else None
+        self.inference_runner_type = InferenceRunnerType(config.inference_runner)
+        self.inference_runner = (
+            None
+            if self.inference_runner_type == InferenceRunnerType.NO_RUNNER
+            else GPTBigCodeInferenceRunner(config, self)
+        )
 
         max_positions = config.max_position_embeddings
         self.register_buffer(

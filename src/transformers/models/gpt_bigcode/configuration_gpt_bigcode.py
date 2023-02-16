@@ -37,6 +37,19 @@ class AttentionType(Enum):
     MULTI_QUERY_2 = 3
 
 
+class InferenceRunnerType(Enum):
+    NO_RUNNER = 0
+    # Use the inference runner without cuda graphs.
+    BASE_RUNNER = 1
+    # Use cuda graphs in the inference runner. Leave out the attention which has a variable shape.
+    # This significantly lowers the cpu time and prevent a cpu bottleneck for smaller batches and models.
+    PARTIAL_GRAPH = 2
+    # Turn the whole model into a cuda graph. One graph for each sequence length.
+    # Note: only useful for small batches and models, graphs take some time to generate, flaky.
+    # Crashes with jit on A100 but seems to work without jit (PYTORCH_JIT=0) and on V100.
+    FULL_GRAPH = 3
+
+
 class GPTBigCodeConfig(PretrainedConfig):
     """
     # TODO: Update doc
@@ -167,10 +180,8 @@ class GPTBigCodeConfig(PretrainedConfig):
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         attention_type=AttentionType.MULTI_HEAD,
-        inference_runner=False,
+        inference_runner=InferenceRunnerType.NO_RUNNER,
         validate_runner_input=True,
-        cuda_graph=False,
-        full_cuda_graph=False,
         runner_max_sequence_length=None,
         **kwargs,
     ):
@@ -202,15 +213,9 @@ class GPTBigCodeConfig(PretrainedConfig):
         # Convert to an int so it's JSON-serializable.
         self.attention_type = AttentionType(attention_type).value
 
-        self.inference_runner = inference_runner
+        self.inference_runner = InferenceRunnerType(inference_runner).value
         # Set to False to disable input validation of safe inputs, for a small speedup.
         self.validate_runner_input = validate_runner_input
-        # Use cuda graphs in the inference runner. Leave out the attention which has a variable shape.
-        # This significantly lowers the cpu time and prevent a cpu bottleneck for smaller batches and models.
-        self.cuda_graph = cuda_graph
-        # Turn the whole model into a cuda graph. One graph for each sequence length. Only used if cuda_graph==True.
-        # Note: only useful for tiny batches and models, graphs take some time to generate, flaky
-        self.full_cuda_graph = full_cuda_graph
         # Set if `n_positions` uses too much memory.
         self.runner_max_sequence_length = runner_max_sequence_length
 
