@@ -376,6 +376,9 @@ class GPTBigCodeInferenceRunner:
         assert self.inference_runner_type != InferenceRunnerType.NO_RUNNER
         self.validate_input = config.validate_runner_input
 
+        # TODO: Support other attention types?
+        assert model.attention_type == AttentionType.MULTI_QUERY_1
+
         self.max_sequence_length = config.runner_max_sequence_length or config.n_positions
         # self.max_batch_size=None
 
@@ -397,19 +400,19 @@ class GPTBigCodeInferenceRunner:
 
         factory_kwargs = {"device": self.device, "dtype": self.dtype}
 
-        hidden_end = attn.embed_dim
+        hidden_end = self.batch_size * attn.embed_dim
         # Query: (bs, embed_dim), also used for attn outputs (no overlap with value).
-        query_end = hidden_end + attn.embed_dim
+        query_end = hidden_end + self.batch_size * attn.embed_dim
         # KV: (bs, 2 * kv_dim), combines with query into c_attn.
-        kv_end = query_end + 2 * attn.kv_dim
+        kv_end = query_end + 2 * self.batch_size * attn.kv_dim
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value
-        attn_weights_end = kv_end + attn.num_heads * self.max_sequence_length
+        attn_weights_end = kv_end + self.batch_size * attn.num_heads * self.max_sequence_length
         # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
         # Also used for MLP projection ()
-        c_proj_end = query_end + attn.embed_dim
-        c_fc_end = hidden_end + block.inner_dim
-        pool_channels = max(attn_weights_end, c_proj_end, c_fc_end)
-        activation_pool = torch.empty((self.batch_size, pool_channels), **factory_kwargs)
+        c_proj_end = query_end + self.batch_size * attn.embed_dim
+        c_fc_end = hidden_end + self.batch_size * block.inner_dim
+        pool_size = max(attn_weights_end, c_proj_end, c_fc_end)
+        activation_pool = torch.empty(pool_size, **factory_kwargs)
         kv_cache = torch.empty(
             (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim),
             **factory_kwargs,
@@ -417,16 +420,20 @@ class GPTBigCodeInferenceRunner:
         self.mask_value = torch.full(
             [], torch.finfo(self.softmax_dtype).min, dtype=self.softmax_dtype, device=self.device
         )
-        attn_mask = torch.empty((self.batch_size, 1, self.max_sequence_length), dtype=torch.bool, device=self.device)
-        self.attn_masks = [attn_mask[:, :, :key_length] for key_length in range(self.max_sequence_length + 1)]
+        # We ensure mask tensors are contiguous to enable more efficient kernels.
+        attn_mask = torch.empty(self.batch_size * self.max_sequence_length, dtype=torch.bool, device=self.device)
+        self.attn_masks = [
+            attn_mask[: self.batch_size * key_length].view(self.batch_size, 1, key_length)
+            for key_length in range(self.max_sequence_length + 1)
+        ]
 
         # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
-        self.hidden_states_squeezed = activation_pool[:, :hidden_end]
+        self.hidden_states_squeezed = activation_pool[:hidden_end].view(self.batch_size, -1)
         self.hidden_states = self.hidden_states_squeezed.unsqueeze(1)
         # QKV: (bs, 2 * kv_dim).
-        self.c_attn = activation_pool[:, hidden_end:kv_end]
-        self.query = activation_pool[:, hidden_end:query_end].view(self.batch_size, attn.num_heads, attn.head_dim)
-        self.kv_attn = activation_pool[:, query_end:kv_end]
+        self.c_attn = activation_pool[hidden_end:kv_end].view(self.batch_size, -1)
+        self.query = activation_pool[hidden_end:query_end].view(self.batch_size, attn.num_heads, attn.head_dim)
+        self.kv_attn = activation_pool[query_end:kv_end].view(self.batch_size, -1)
 
         self.kv_caches = (kv_cache.squeeze(2) if attn.is_mqa else kv_cache).unbind(0)
         self.kv_caches_unbound = [cache.unbind(-2) for cache in self.kv_caches]
@@ -444,23 +451,24 @@ class GPTBigCodeInferenceRunner:
         ]
 
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
-        attn_weights = activation_pool[:, kv_end:attn_weights_end].view(
+        attn_weights = activation_pool[kv_end:attn_weights_end].view(
             self.batch_size, attn.num_heads, self.max_sequence_length
         )
         self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length + 1)]
 
         # Attn outputs: (batch_size, embed_dim), no overlap with value.
-        self.attn_output = activation_pool[:, hidden_end:query_end]
+        self.attn_output = activation_pool[hidden_end:query_end].view(self.batch_size, -1)
         self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
         # Attn projection: (batch_size, embed_dim), no overlap with attn outputs.
-        self.c_proj = activation_pool[:, query_end:c_proj_end]
+        self.c_proj = activation_pool[query_end:c_proj_end].view(self.batch_size, -1)
 
         # MLP first layer: (batch_size, embed_dim)
-        self.mlp_c_fc = activation_pool[:, hidden_end:c_fc_end]
+        self.mlp_c_fc = activation_pool[hidden_end:c_fc_end].view(self.batch_size, -1)
         # MLP projection: (batch_size, inner_dim)
-        self.mlp_c_proj = activation_pool[:, hidden_end:query_end]
+        self.mlp_c_proj = activation_pool[hidden_end:query_end].view(self.batch_size, -1)
 
         if self.inference_runner_type != InferenceRunnerType.BASE_RUNNER:
+            print(f"Generating cuda graphs")
             self.memory_pool = None
             if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
                 self.cuda_graphs = {}
@@ -474,9 +482,9 @@ class GPTBigCodeInferenceRunner:
 
     def _generate_cuda_graphs(self):
         self.cuda_graphs = {}
-        print(f"Generating cuda graphs")
         for layer_idx in range(self.n_layer + 1):
             graph = torch.cuda.CUDAGraph()
+
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 if layer_idx > 0:
                     self._forward_post_attn(self.model.h[layer_idx - 1])
@@ -489,14 +497,20 @@ class GPTBigCodeInferenceRunner:
             self.cuda_graphs[layer_idx] = graph
 
     def _generate_full_cuda_graph(self, key_length):
-        print(f"Generating cuda graph for key length {key_length}")
+        # We need to warmup the jit function before creating the graph, otherwise it will crash.
+        # Warmup needs to be done for every input shape (key length), and for both scale == 1 and scale != 1
+        if self.upcast:
+            for scale in (1.0, 2.0):
+                upcast_masked_softmax(
+                    self.attn_weights[key_length],
+                    self.attn_masks[key_length],
+                    self.mask_value,
+                    scale,
+                    self.softmax_dtype,
+                )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.memory_pool):
-            for block in self.model.h:
-                self._forward_qkv(block)
-                self._forward_attn(block, key_length)
-                self._forward_post_attn(block)
-            self.output_hidden_states[key_length] = self._forward_end()
+            self.output_hidden_states[key_length] = self._forward(key_length)
         if self.memory_pool is None:
             self.memory_pool = graph.pool()
         self.cuda_graphs[key_length] = graph
@@ -564,6 +578,13 @@ class GPTBigCodeInferenceRunner:
         # LN doesn't support out argument.
         return self.model.ln_f(self.hidden_states)
 
+    def _forward(self, key_length):
+        for block in self.model.h:
+            self._forward_qkv(block)
+            self._forward_attn(block, key_length)
+            self._forward_post_attn(block)
+        return self._forward_end()
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -615,11 +636,7 @@ class GPTBigCodeInferenceRunner:
             self.cuda_graphs[self.n_layer].replay()
             hidden_states = self.output_hidden_states
         else:
-            for block in self.model.h:
-                self._forward_qkv(block)
-                self._forward_attn(block, key_length)
-                self._forward_post_attn(block)
-            hidden_states = self._forward_end()
+            hidden_states = self._forward(key_length)
 
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
