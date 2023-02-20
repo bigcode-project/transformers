@@ -864,10 +864,39 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         state_dict_mq2["c_proj.bias"] = proj_bias
         attention_mq2.load_state_dict(state_dict_mq2)
 
-        # RUN CORRECTNESS TEST
+        # RUN CORRECTNESS TEST IN EVAL MODE
         attention_mh.eval()
         attention_mq1.eval()
         attention_mq2.eval()
+
+        num_tokens = 5
+
+        for i in range(5):
+            hidden_states = torch.randn(1, num_tokens, embed_dim)
+            attention_mh_result = attention_mh(hidden_states)[0]
+            attention_mq1_result = attention_mq1(hidden_states)[0]
+            attention_mq2_result = attention_mq2(hidden_states)[0]
+
+            tolerance = 1e-6
+            self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result, atol=tolerance))
+            self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result, atol=tolerance))
+            self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result, atol=tolerance))
+
+        # RUN CORRECTNESS TEST IN TRAIN MODE
+        attention_mh.train()
+        attention_mq1.train()
+        attention_mq2.train()
+
+        # disable dropouts
+        for module in attention_mh.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
+        for module in attention_mq1.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
+        for module in attention_mq2.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
 
         num_tokens = 5
 
