@@ -102,14 +102,13 @@ class Conv1D(nn.Module):
         nx (`int`): The number of input features.
     """
 
-    def __init__(self, nf, nx, device=None, dtype=None):
-        factory_kwargs = {"device": device, "dtype": dtype}
+    def __init__(self, nf, nx):
         super().__init__()
         self.nf = nf
-        w = torch.empty(nx, nf, **factory_kwargs)
+        w = torch.empty(nx, nf)
         nn.init.normal_(w, std=0.02)
         self.weight = nn.Parameter(w)
-        self.bias = nn.Parameter(torch.zeros(nf, **factory_kwargs))
+        self.bias = nn.Parameter(torch.zeros(nf))
 
     def forward(self, x):
         size_out = x.size()[:-1] + (self.nf,)
