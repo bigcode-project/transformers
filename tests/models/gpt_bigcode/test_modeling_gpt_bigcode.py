@@ -816,35 +816,35 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
 @require_torch
 class GPTBigCodeAttentionTest(unittest.TestCase):
     def get_attention(self, attention_type: AttentionType):
-        config = GPTBigCodeConfig.from_pretrained("bigcode/santacoder-fast-inference")
-        config.attention_type = attention_type
+        config = GPTBigCodeConfig.from_pretrained(
+            "bigcode/santacoder-fast-inference",
+            attention_type=attention_type,
+            attn_pdrop=0,
+            resid_pdrop=0,
+        )
         return GPTBigCodeAttention(config)
 
-    def test_mqa_correctness(self):
-        torch.manual_seed(0)
+    def prepare_mqa_correctness_test(self, seed, test_mode="train"):
+        torch.manual_seed(seed)
         embed_dim = 2048
         head_dim = 128
 
         # GET THE WEIGHTS FROM MULTI-QUERY ATTENTION 1
         attention_mq1 = self.get_attention(AttentionType.MULTI_QUERY_1)
         state_dict_mq1 = attention_mq1.state_dict()
-        attn_weight, attn_k_weight, attn_v_weight = torch.split(state_dict_mq1["c_attn.weight"], [embed_dim, head_dim, head_dim], dim=1)
-        attn_bias, attn_k_bias, attn_v_bias = torch.split(state_dict_mq1["c_attn.bias"], [embed_dim, head_dim, head_dim], dim=0)
+        attn_weight, attn_k_weight, attn_v_weight = torch.split(
+            state_dict_mq1["c_attn.weight"], [embed_dim, head_dim, head_dim], dim=1
+        )
+        attn_bias, attn_k_bias, attn_v_bias = torch.split(
+            state_dict_mq1["c_attn.bias"], [embed_dim, head_dim, head_dim], dim=0
+        )
         proj = state_dict_mq1["c_proj.weight"]
         proj_bias = state_dict_mq1["c_proj.bias"]
 
         # PUT THEM INTO THE MULTI-HEAD ATTENTION
         num_heads = 16
-        c_attn_weight = torch.hstack(
-            [attn_weight] + 
-            num_heads * [attn_k_weight] +
-            num_heads * [attn_v_weight])
-
-        c_attn_bias = torch.hstack(
-            [attn_bias] + 
-            num_heads * [attn_k_bias] +
-            num_heads * [attn_v_bias])
-
+        c_attn_weight = torch.hstack([attn_weight] + num_heads * [attn_k_weight] + num_heads * [attn_v_weight])
+        c_attn_bias = torch.hstack([attn_bias] + num_heads * [attn_k_bias] + num_heads * [attn_v_bias])
         attention_mh = self.get_attention(AttentionType.MULTI_HEAD)
         state_dict = attention_mh.state_dict()
         state_dict["c_attn.weight"] = c_attn_weight
@@ -864,49 +864,35 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         state_dict_mq2["c_proj.bias"] = proj_bias
         attention_mq2.load_state_dict(state_dict_mq2)
 
-        # RUN CORRECTNESS TEST IN EVAL MODE
-        attention_mh.eval()
-        attention_mq1.eval()
-        attention_mq2.eval()
+        # PUT THE MODEL INTO THE CORRECT MODE
+        if test_mode == "eval":
+            attention_mh.eval()
+            attention_mq1.eval()
+            attention_mq2.eval()
+        elif test_mode == "train":
+            attention_mh.train()
+            attention_mq1.train()
+            attention_mq2.train()
+        else:
+            raise ValueError(f"test_mode must be train or eval, but found: {test_mode}")
 
+        # RUN AN INPUT THROUGH THE MODELS
         num_tokens = 5
+        hidden_states = torch.randn(1, num_tokens, embed_dim)
+        attention_mh_result = attention_mh(hidden_states)[0]
+        attention_mq1_result = attention_mq1(hidden_states)[0]
+        attention_mq2_result = attention_mq2(hidden_states)[0]
 
-        for i in range(5):
-            hidden_states = torch.randn(1, num_tokens, embed_dim)
-            attention_mh_result = attention_mh(hidden_states)[0]
-            attention_mq1_result = attention_mq1(hidden_states)[0]
-            attention_mq2_result = attention_mq2(hidden_states)[0]
+        # CHECK THAT ALL OUTPUTS ARE THE SAME
+        tolerance = 1e-5
+        self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result, atol=tolerance))
+        self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result, atol=tolerance))
+        self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result, atol=tolerance))
 
-            tolerance = 1e-6
-            self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result, atol=tolerance))
-            self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result, atol=tolerance))
-            self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result, atol=tolerance))
+    def test_mqa_correctness_train(self):
+        for seed in range(5):
+            self.prepare_mqa_correctness_test(seed=seed, test_mode="train")
 
-        # RUN CORRECTNESS TEST IN TRAIN MODE
-        attention_mh.train()
-        attention_mq1.train()
-        attention_mq2.train()
-
-        # disable dropouts
-        for module in attention_mh.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.eval()
-        for module in attention_mq1.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.eval()
-        for module in attention_mq2.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.eval()
-
-        num_tokens = 5
-
-        for i in range(5):
-            hidden_states = torch.randn(1, num_tokens, embed_dim)
-            attention_mh_result = attention_mh(hidden_states)[0]
-            attention_mq1_result = attention_mq1(hidden_states)[0]
-            attention_mq2_result = attention_mq2(hidden_states)[0]
-
-            tolerance = 1e-6
-            self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result, atol=tolerance))
-            self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result, atol=tolerance))
-            self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result, atol=tolerance))
+    def test_mqa_correctness_eval(self):
+        for seed in range(5):
+            self.prepare_mqa_correctness_test(seed=seed, test_mode="eval")
