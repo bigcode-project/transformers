@@ -200,16 +200,12 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
             op_name == "attention.query_key_value" or op_name == "self_attention.query_key_value"
         ) and weight_or_bias == "weight":
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 3, heads, hidden_size_per_head)
-            # Megatron stores (3*D) x D but transformers-GPT2 expects D x 3*D.
-            out_val = out_val.transpose(0, 1).contiguous()
             # Store.
             output_state_dict[layer_name + ".attn.c_attn.weight"] = out_val
 
         # Tranpose the Q matrix (for MQA)
         elif (op_name == "self_attention.query") and weight_or_bias == "weight":
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 1, heads, hidden_size_per_head)
-            # Megatron stores (out x in) but transformers-GPT2 expects (in x out).
-            out_val = out_val.transpose(0, 1).contiguous()
             # Store.
             output_state_dict[layer_name + ".attn.q_attn.weight"] = out_val
 
@@ -217,13 +213,11 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         elif (op_name == "self_attention.key_value") and weight_or_bias == "weight":
             # Key-values are shared across heads
             out_val = fix_query_key_value_ordering(val, checkpoint_version, 2, 1, hidden_size_per_head)
-            # Megatron stores (out x in) but transformers-GPT2 expects (in x out).
-            out_val = out_val.transpose(0, 1).contiguous()
             if args.merge_qkv:
                 # Concatenate the tensors.
                 # Query is before key_value in the dict.
                 query = output_state_dict.pop(layer_name + ".attn.q_attn.weight")
-                out_val = torch.cat([query, out_val], dim=1)
+                out_val = torch.cat([query, out_val], dim=0)
                 output_state_dict[layer_name + ".attn.c_attn.weight"] = out_val
             else:
                 # Store.
@@ -259,11 +253,11 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
                 # Store. No change of shape.
                 output_state_dict[layer_name + ".attn.kv_attn.bias"] = out_val
 
-        # Transpose the weights.
+        # Copy the weights.
         elif weight_or_bias == "weight":
 
             out_name = megatron_to_transformers[op_name]
-            output_state_dict[layer_name + out_name + "weight"] = val.transpose(0, 1)
+            output_state_dict[layer_name + out_name + "weight"] = val
 
         # Copy the bias.
         elif weight_or_bias == "bias":

@@ -4,8 +4,7 @@ import subprocess
 from pathlib import Path
 
 from huggingface_hub import Repository
-
-from .convert_megatron_gpt_bigcode_checkpoint import main as convert
+from transformers.models.megatron_gpt_bigcode.convert_megatron_gpt_bigcode_checkpoint import main as convert
 
 
 """

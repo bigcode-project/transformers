@@ -33,7 +33,7 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel, SequenceSummary
-from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
+from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.utils import (
     ModelOutput,
     add_code_sample_docstrings,
@@ -179,17 +179,17 @@ class GPTBigCodeAttention(nn.Module):
             if self.is_mqa:
                 raise NotImplementedError(f"attention_type {self.attention_type}  for cross_attention")
 
-            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
-            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+            self.c_attn = torch.nn.Linear(self.embed_dim, 2 * self.embed_dim)
+            self.q_attn = torch.nn.Linear(self.embed_dim, self.embed_dim)
         else:
             if self.attention_type == AttentionType.MULTI_QUERY_2:
-                self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+                self.q_attn = torch.nn.Linear(self.embed_dim, self.embed_dim)
                 # Keys and values are shared across heads
-                self.kv_attn = Conv1D(2 * self.head_dim, self.embed_dim)
+                self.kv_attn = torch.nn.Linear(self.head_dim, 2 * self.embed_dim)
             else:
-                self.c_attn = Conv1D(self.embed_dim + 2 * self.kv_dim, self.embed_dim)
+                self.c_attn = torch.nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_dim)
 
-        self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+        self.c_proj = torch.nn.Linear(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -202,9 +202,9 @@ class GPTBigCodeAttention(nn.Module):
         heads, index = find_pruneable_heads_and_indices(heads, self.num_heads, self.head_dim, self.pruned_heads)
         index_attn = torch.cat([index, index + self.split_size, index + (2 * self.split_size)])
 
-        # Prune conv1d layers
-        self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
-        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
+        # Prune linear layers
+        self.c_attn = prune_linear_layer(self.c_attn, index_attn, dim=1)
+        self.c_proj = prune_linear_layer(self.c_proj, index, dim=0)
 
         # Update hyper params
         self.split_size = (self.split_size // self.num_heads) * (self.num_heads - len(heads))
@@ -353,8 +353,8 @@ class GPTBigCodeMLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
         embed_dim = config.hidden_size
-        self.c_fc = Conv1D(intermediate_size, embed_dim)
-        self.c_proj = Conv1D(embed_dim, intermediate_size)
+        self.c_fc = torch.nn.Linear(embed_dim, intermediate_size)
+        self.c_proj = torch.nn.Linear(intermediate_size, embed_dim)
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -367,6 +367,7 @@ class GPTBigCodeMLP(nn.Module):
 
 
 class GPTBigCodeInferenceRunner:
+    # TODO: Use F.linear.
     def __init__(self, config: GPTBigCodeConfig, model):
         self.batch_size = None
         self.model = model
@@ -742,7 +743,7 @@ class GPTBigCodePreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """Initialize the weights."""
-        if isinstance(module, (nn.Linear, Conv1D)):
+        if isinstance(module, nn.Linear):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
