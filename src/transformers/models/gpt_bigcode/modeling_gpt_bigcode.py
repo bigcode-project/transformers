@@ -342,12 +342,12 @@ class GPTBigCodeAttention(nn.Module):
                 )
 
             query = self.q_attn(hidden_states)
-            key_value = self.c_attn(encoder_hidden_states)  # .split(self.split_size, dim=2)
+            key_value = self.c_attn(encoder_hidden_states)
             attention_mask = encoder_attention_mask
         else:
             if self.attention_type == AttentionType.MULTI_QUERY_2:
                 query = self.q_attn(hidden_states)
-                key_value = self.kv_attn(hidden_states)  # .split((self.kv_dim, self.kv_dim), dim=2)
+                key_value = self.kv_attn(hidden_states)
             else:
                 query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
 
