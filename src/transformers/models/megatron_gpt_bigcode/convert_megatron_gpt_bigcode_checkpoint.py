@@ -112,6 +112,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         config.n_inner = ds_args.ffn_hidden_size
 
         if ds_args.attention_head_type == "multihead":
+            # TODO: Adjust qkv layout (no need to fix_query_key_value_ordering anymore)
             config.attention_type = 1
         else:
             assert ds_args.attention_head_type == "multiquery"

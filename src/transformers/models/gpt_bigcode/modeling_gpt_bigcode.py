@@ -18,7 +18,7 @@
 import math
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -185,7 +185,7 @@ class GPTBigCodeAttention(nn.Module):
             if self.attention_type == AttentionType.MULTI_QUERY_2:
                 self.q_attn = torch.nn.Linear(self.embed_dim, self.embed_dim)
                 # Keys and values are shared across heads
-                self.kv_attn = torch.nn.Linear(self.head_dim, 2 * self.embed_dim)
+                self.kv_attn = torch.nn.Linear(self.embed_dim, 2 * self.head_dim)
             else:
                 self.c_attn = torch.nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_dim)
 
@@ -197,6 +197,8 @@ class GPTBigCodeAttention(nn.Module):
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
+        if self.is_mqa:
+            raise NotImplementedError("prune_heads not implemented for MQA")
         if len(heads) == 0:
             return
         heads, index = find_pruneable_heads_and_indices(heads, self.num_heads, self.head_dim, self.pruned_heads)
@@ -248,7 +250,32 @@ class GPTBigCodeAttention(nn.Module):
         if self.scale_attn_weights:
             scale_factor /= self.head_dim**0.5
 
-        attn_weights = self._matmul(query, key.transpose(-1, -2), scale_factor=scale_factor)
+        # MQA: (b, sq, nh * hs)
+        # MHA: (b, nh, sq, hs)
+        query_shape = query.shape
+        batch_size = query_shape[0]
+        key_length = key.size(-1)
+        if self.is_mqa:
+            # (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
+            query_length = query_shape[1]
+            attn_shape = (batch_size, query_length, self.num_heads, key_length)
+            attn_view = (batch_size, query_length * self.num_heads, key_length)
+            # No copy needed for MQA 2, or when layer_past is provided.
+            query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+        else:
+            # (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
+            query_length = query_shape[2]
+            attn_shape = (batch_size, self.num_heads, query_length, key_length)
+            attn_view = (batch_size * self.num_heads, query_length, key_length)
+            # Always copies
+            query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
+            # No copy when layer_past is provided.
+            key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
+        attn_weights = torch.baddbmm(
+            torch.empty(attn_view, dtype=query.dtype, device=query.device), query, key, beta=0, alpha=scale_factor
+        ).view(attn_shape)
+
+        # attn_weights = self._matmul(query, key, scale_factor=scale_factor)
 
         if upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
@@ -270,7 +297,10 @@ class GPTBigCodeAttention(nn.Module):
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
-        attn_output = self._matmul(attn_weights, value)
+        if self.is_mqa:
+            attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
+        else:
+            attn_output = torch.matmul(attn_weights, value)
 
         return attn_output, attn_weights
 
@@ -296,7 +326,7 @@ class GPTBigCodeAttention(nn.Module):
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        layer_past: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -312,37 +342,36 @@ class GPTBigCodeAttention(nn.Module):
                 )
 
             query = self.q_attn(hidden_states)
-            key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
+            key_value = self.c_attn(encoder_hidden_states)  # .split(self.split_size, dim=2)
             attention_mask = encoder_attention_mask
         else:
             if self.attention_type == AttentionType.MULTI_QUERY_2:
                 query = self.q_attn(hidden_states)
-                key, value = self.kv_attn(hidden_states).split((self.kv_dim, self.kv_dim), dim=2)
+                key_value = self.kv_attn(hidden_states)  # .split((self.kv_dim, self.kv_dim), dim=2)
             else:
-                query, key, value = self.c_attn(hidden_states).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=2)
+                query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
 
-        query = self._split_heads(query, self.num_heads, self.head_dim, permute=not self.is_mqa)
         if not self.is_mqa:
-            key = self._split_heads(key, self.num_heads, self.head_dim)
-            value = self._split_heads(value, self.num_heads, self.head_dim)
+            query = self._split_heads(query, self.num_heads, self.head_dim, permute=not self.is_mqa)
+            # Note: We split as (self.num_heads, 2, self.head_dim) instead of (2, self.num_heads, self.head_dim),
+            # i.e., the memory layout is not the same as GPT2.
+            # This makes the concatenation with past_key_value more efficient.
+            key_value = self._split_heads(key_value, self.num_heads, 2 * self.head_dim)
 
         if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+            key_value = torch.cat((layer_past, key_value), dim=-2)
 
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
+        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim, permute=not self.is_mqa)
+        if not self.is_mqa:
+            attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim, permute=not self.is_mqa)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        outputs = (attn_output, present)
+        # TODO: Is it ok to send unwrapped present?
+        outputs = (attn_output, key_value if use_cache else None)
         if output_attentions:
             outputs += (attn_weights,)
 
@@ -431,31 +460,32 @@ class GPTBigCodeInferenceRunner:
         # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
         self.hidden_states_squeezed = activation_pool[:hidden_end].view(self.batch_size, -1)
         self.hidden_states = self.hidden_states_squeezed.unsqueeze(1)
-        # QKV: (bs, 2 * kv_dim).
+        # QKV: (bs, embed_dim + 2 * kv_dim).
         self.c_attn = activation_pool[hidden_end:kv_end].view(self.batch_size, -1)
-        self.query = activation_pool[hidden_end:query_end].view(self.batch_size, attn.num_heads, attn.head_dim)
-        self.kv_attn = activation_pool[query_end:kv_end].view(self.batch_size, -1)
+        self.query = self.c_attn[:, : attn.embed_dim].view(self.batch_size, attn.num_heads, attn.head_dim)
+        self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
-        self.kv_caches = (kv_cache.squeeze(2) if attn.is_mqa else kv_cache).unbind(0)
-        self.kv_caches_unbound = [cache.unbind(-2) for cache in self.kv_caches]
-
-        head_slice = 0 if attn.is_mqa else slice(None)
         key, value = kv_cache.split((attn.head_dim, attn.head_dim), dim=-1)
         key = key.transpose(-1, -2)
-        # TODO: Is this slow? CPU Memory usage?
-        self.keys_values = [
-            [
-                (key[layer_idx, :, head_slice, :, :key_length], value[layer_idx, :, head_slice, :key_length, :])
-                for key_length in range(self.max_sequence_length + 1)
-            ]
-            for layer_idx in range(self.n_layer)
+        head_slice = 0 if attn.is_mqa else slice(None)
+        key_lengths = range(self.max_sequence_length + 1)
+
+        self.keys = [key[:, :, head_slice, :, :key_length].unbind(0) for key_length in key_lengths]
+        self.values = [value[:, :, head_slice, :key_length, :].unbind(0) for key_length in key_lengths]
+
+        # This is nonsense for key_length == 0, but we never need the value.
+        self.current_key_values = [
+            kv_cache[:, :, head_slice, key_length - 1, :].unbind(0) for key_length in key_lengths
+        ]
+        self.past_key_values = [
+            kv_cache[:, :, head_slice, : key_length - 1, :].unbind(0) for key_length in key_lengths
         ]
 
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
         attn_weights = activation_pool[kv_end:attn_weights_end].view(
             self.batch_size, attn.num_heads, self.max_sequence_length
         )
-        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in range(self.max_sequence_length + 1)]
+        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in key_lengths]
 
         # Attn outputs: (batch_size, embed_dim), no overlap with value.
         self.attn_output = activation_pool[hidden_end:query_end].view(self.batch_size, -1)
@@ -525,22 +555,21 @@ class GPTBigCodeInferenceRunner:
     def _forward_qkv(self, block):
         # LN doesn't support out argument.
         hidden_states = block.ln_1(self.hidden_states_squeezed)
-        torch.addmm(
-            block.attn.c_attn.bias,
+        torch.nn.functional.linear(
             hidden_states,
             block.attn.c_attn.weight,
+            block.attn.c_attn.bias,
             out=self.c_attn,
         )
 
     def _forward_attn(self, block, key_length):
         layer_idx = block.attn.layer_idx
-        self.kv_caches_unbound[layer_idx][key_length - 1].copy_(self.kv_attn)
-        key, value = self.keys_values[layer_idx][key_length]
+        self.current_key_values[key_length][layer_idx].copy_(self.kv_attn)
         attn_weights = self.attn_weights[key_length]
         torch.baddbmm(
             attn_weights,
             self.query,
-            key,
+            self.keys[key_length][layer_idx],
             beta=0,
             alpha=self.scale[layer_idx],
             out=attn_weights,
@@ -556,23 +585,24 @@ class GPTBigCodeInferenceRunner:
             torch.where(self.attn_masks[key_length], attn_weights, self.mask_value, out=attn_weights)
             torch.softmax(attn_weights, dim=-1, out=attn_weights)
 
-        torch.bmm(attn_weights, value, out=self.attn_output_expanded)
-        return key, value
+        torch.bmm(attn_weights, self.values[key_length][layer_idx], out=self.attn_output_expanded)
 
     def _forward_post_attn(self, block):
-        torch.addmm(
-            block.attn.c_proj.bias,
+        torch.nn.functional.linear(
             self.attn_output,
             block.attn.c_proj.weight,
+            block.attn.c_proj.bias,
             out=self.c_proj,
         )
         self.hidden_states_squeezed.add_(self.c_proj)
         # LN doesn't support out argument.
         hidden_states = block.ln_2(self.hidden_states_squeezed)
-        torch.addmm(block.mlp.c_fc.bias, hidden_states, block.mlp.c_fc.weight, out=self.mlp_c_fc)
+        torch.nn.functional.linear(hidden_states, block.mlp.c_fc.weight, block.mlp.c_fc.bias, out=self.mlp_c_fc)
         # Most activations don't support out argument.
         feed_forward_hidden_states = block.mlp.act(self.mlp_c_fc)
-        torch.addmm(block.mlp.c_proj.bias, feed_forward_hidden_states, block.mlp.c_proj.weight, out=self.mlp_c_proj)
+        torch.nn.functional.linear(
+            feed_forward_hidden_states, block.mlp.c_proj.weight, block.mlp.c_proj.bias, out=self.mlp_c_proj
+        )
         self.hidden_states_squeezed.add_(self.mlp_c_proj)
 
     def _forward_end(self):
@@ -591,7 +621,7 @@ class GPTBigCodeInferenceRunner:
         input_ids: torch.LongTensor,
         attention_mask: torch.FloatTensor,
         position_ids: torch.LongTensor,
-        past_key_values: Union[Tuple[Tuple[torch.Tensor, torch.Tensor], ...], int],
+        past_key_values: Union[List[torch.Tensor], int],
     ) -> BaseModelOutputWithPastAndCrossAttentions:
         batch_size, query_length = input_ids.shape
         assert query_length == 1
@@ -613,11 +643,8 @@ class GPTBigCodeInferenceRunner:
             key_length = attention_mask.shape[1]
 
         if not isinstance(past_key_values, int):
-            # TODO: This could be improved.
-            for layer_idx, (key, value) in enumerate(past_key_values):
-                key_buf, value_buf = self.keys_values[layer_idx][key_length - 1]
-                key_buf.copy_(key.transpose(-1, -2))
-                value_buf.copy_(value)
+            for buffer, past_key_value in zip(self.past_key_values[key_length], past_key_values):
+                buffer.copy_(past_key_value)
 
         # Copy gives a fixed position and replaces conversion to bool.
         self.attn_masks[key_length].copy_(attention_mask.unsqueeze(1))
@@ -625,7 +652,6 @@ class GPTBigCodeInferenceRunner:
         self._forward_embed(input_ids, position_ids)
 
         if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
-            # TODO: This crashes jit (INTERNAL ASSERT FAILED, can run with PYTORCH_JIT=0)
             if key_length not in self.cuda_graphs:
                 self._generate_full_cuda_graph(key_length)
             self.cuda_graphs[key_length].replay()
@@ -666,14 +692,14 @@ class GPTBigCodeBlock(nn.Module):
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        layer_past: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-    ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
+    ) -> Tuple:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
@@ -1045,7 +1071,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Tuple[Tuple[torch.Tensor, torch.Tensor], ...], int]] = None,
+        past_key_values: Optional[Union[List[torch.Tensor], int]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -1164,7 +1190,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        presents = () if use_cache else None
+        presents = [] if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
@@ -1221,8 +1247,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 )
 
             hidden_states = outputs[0]
-            if use_cache is True:
-                presents = presents + (outputs[1],)
+            if use_cache:
+                presents.append(outputs[1])
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
