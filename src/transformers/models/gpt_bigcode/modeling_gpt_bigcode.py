@@ -33,7 +33,7 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel, SequenceSummary
-from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_linear_layer
+from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.utils import (
     ModelOutput,
     add_code_sample_docstrings,
@@ -44,7 +44,7 @@ from transformers.utils import (
 )
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 
-from .configuration_gpt_bigcode import AttentionType, GPTBigCodeConfig, InferenceRunnerType
+from .configuration_gpt_bigcode import AttentionType, GPTBigCodeConfig
 
 
 logger = logging.get_logger(__name__)
@@ -212,27 +212,6 @@ class GPTBigCodeAttention(nn.Module):
         self.split_size = (self.split_size // self.num_heads) * (self.num_heads - len(heads))
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
-
-    def _matmul(self, x, y, dtype=None, scale_factor=1.0):
-        output_shape = (*x.size()[:-1], y.size(-1))
-        if self.is_mqa:
-            # Q x K: (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
-            # A X V: (b, sq, nh, sk) x (b, sk, hs) -> (b, sq, nh, hs)
-            output_view = (x.size(0), x.size(1) * x.size(2), y.size(-1))
-            # No copy needed for MQA 2, or when layer_past is provided.
-            x = x.reshape(*output_view[:-1], x.size(-1))
-        else:
-            # Q x K: (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
-            # A X V: (b, nh, sq, sk) x (b, nh, sk, hs) -> (b, nh, sq, hs)
-            output_view = (x.size(0) * x.size(1), x.size(2), y.size(-1))
-            # Always copies
-            x = x.reshape(output_view[0], *x.size()[2:])
-            # No copy when layer_past is provided.
-            y = y.reshape(output_view[0], *y.size()[2:])
-        # This is identical to matmul when scale_factor==1
-        z = torch.empty(output_view, dtype=x.dtype if dtype is None else dtype, device=x.device)
-        z = torch.baddbmm(z, x, y, beta=0, alpha=scale_factor)
-        return z.view(output_shape)
 
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
