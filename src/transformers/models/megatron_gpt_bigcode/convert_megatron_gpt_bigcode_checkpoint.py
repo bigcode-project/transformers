@@ -32,8 +32,6 @@
 # in your path, i.e., /path/to/Megatron-DeepSpeed/
 #
 
-# TODO: Update this file
-
 import argparse
 import os
 import re
@@ -191,7 +189,7 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
             out_val = torch.cat([query, val], dim=0)
             output_state_dict[layer_name + ".attn.c_attn." + weight_or_bias] = out_val
 
-        # Copy the weights or biases.
+        # Copy the parameters.
         else:
             output_state_dict[layer_name + megatron_to_transformers[op_name] + weight_or_bias] = val
 
