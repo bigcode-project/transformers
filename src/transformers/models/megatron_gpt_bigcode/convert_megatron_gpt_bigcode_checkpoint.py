@@ -66,6 +66,16 @@ def recursive_print(name, val, spaces=0):
 
 ####################################################################################################
 
+# The simple map of names for "automated" rules.
+NAME_MAP = {
+    "attention.dense": ".attn.c_proj.",
+    "self_attention.dense": ".attn.c_proj.",
+    "mlp.dense_h_to_4h": ".mlp.c_fc.",
+    "mlp.dense_4h_to_h": ".mlp.c_proj.",
+    "self_attention.query_key_value": ".attn.c_attn.",
+    "self_attention.query": ".attn.q_attn.",
+    "self_attention.key_value": ".attn.kv_attn.",
+}
 
 def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     # The converted output model.
@@ -95,7 +105,7 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     config = GPTBigCodeConfig(
         architectures=["GPTBigCodeLMHeadModel"],
         vocab_size=ds_args.padded_vocab_size,
-        n_positions=ds_args.max_position_embedding,
+        n_positions=ds_args.max_position_embeddings,
         n_embd=ds_args.hidden_size,
         n_layer=ds_args.num_layers,
         n_head=ds_args.num_attention_heads,
@@ -125,7 +135,7 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     # pprint(config)
 
     # Megatron-LM checkpoint version
-    checkpoint_version = input_state_dict.get("checkpoint_version", 0.0)
+    checkpoint_version = input_state_dict["checkpoint_version"]
     if checkpoint_version < 2.0:
         raise NotImplementedError(f"Checkpoint version {checkpoint_version} not supported.")
 
@@ -145,17 +155,6 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     # The regex to extract layer names.
     layer_re = re.compile("layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
 
-    # The simple map of names for "automated" rules.
-    megatron_to_transformers = {
-        "attention.dense": ".attn.c_proj.",
-        "self_attention.dense": ".attn.c_proj.",
-        "mlp.dense_h_to_4h": ".mlp.c_fc.",
-        "mlp.dense_4h_to_h": ".mlp.c_proj.",
-        "attention.query_key_value": ".attn.c_attn.",
-        "self_attention.query_key_value": ".attn.c_attn.",
-        "attention.query": ".attn.q_attn.",
-        "attention.key_value": ".attn.kv_attn.",
-    }
 
     # Extract the layers.
     for key, val in transformer.items():
@@ -191,7 +190,7 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
 
         # Copy the parameters.
         else:
-            output_state_dict[layer_name + megatron_to_transformers[op_name] + weight_or_bias] = val
+            output_state_dict[layer_name + NAME_MAP[op_name] + weight_or_bias] = val
 
     # DEBUG.
     assert config.n_layer == layer_idx + 1
