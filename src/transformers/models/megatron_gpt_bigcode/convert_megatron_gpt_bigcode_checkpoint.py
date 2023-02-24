@@ -69,62 +69,58 @@ def recursive_print(name, val, spaces=0):
 ####################################################################################################
 
 
-def convert_megatron_checkpoint(args, input_state_dict, config):
+def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     # The converted output model.
     output_state_dict = {}
     ds_args = input_state_dict["args"]
 
-    # Read the config, or default to the model released by NVIDIA.
-    if config is None:
-        # TODO: FP32 softmax
-
-        if ds_args is not None:
-            if ds_args.bias_gelu_fusion:
-                activation_function = "gelu_pytorch_tanh"
-            elif ds_args.openai_gelu:
-                activation_function = "gelu_new"
-            else:
-                activation_function = "gelu"
-        else:
-            # in the very early days this used to be "gelu_new"
+    if ds_args is not None:
+        if ds_args.bias_gelu_fusion:
+            activation_function = "gelu_pytorch_tanh"
+        elif ds_args.openai_gelu:
             activation_function = "gelu_new"
-
-        if ds_args.attention_head_type == "multihead":
-            attention_type = 1
         else:
-            assert ds_args.attention_head_type == "multiquery"
-            attention_type = 2 if args.merge_qkv else 3
+            activation_function = "gelu"
+    else:
+        # in the very early days this used to be "gelu_new"
+        activation_function = "gelu_new"
 
-        attention_softmax_in_fp32 = ds_args.attention_softmax_in_fp32 or ds_args.apply_query_key_layer_scaling
+    if ds_args.attention_head_type == "multihead":
+        attention_type = 1
+    else:
+        assert ds_args.attention_head_type == "multiquery"
+        attention_type = 2 if merge_qkv else 3
 
-        # Spell out all parameters in case the defaults change.
-        config = GPTBigCodeConfig(
-            architectures=["GPTBigCodeLMHeadModel"],
-            vocab_size=ds_args.padded_vocab_size,
-            n_positions=ds_args.max_position_embedding,
-            n_embd=ds_args.hidden_size,
-            n_layer=ds_args.num_layers,
-            n_head=ds_args.num_attention_heads,
-            n_inner=ds_args.ffn_hidden_size,
-            activation_function=activation_function,
-            attention_type=attention_type,
-            resid_pdrop=0.1,
-            embd_pdrop=0.1,
-            attn_pdrop=0.1,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            summary_type="cls_index",
-            summary_use_proj=True,
-            summary_activation=None,
-            summary_proj_to_labels=True,
-            summary_first_dropout=0.1,
-            scale_attn_weights=True,
-            use_cache=True,
-            bos_token_id=50256,
-            eos_token_id=50256,
-            attention_softmax_in_fp32=attention_softmax_in_fp32,
-            scale_attention_softmax_in_fp32=True,
-        )
+    attention_softmax_in_fp32 = ds_args.attention_softmax_in_fp32 or ds_args.apply_query_key_layer_scaling
+
+    # Spell out all parameters in case the defaults change.
+    config = GPTBigCodeConfig(
+        architectures=["GPTBigCodeLMHeadModel"],
+        vocab_size=ds_args.padded_vocab_size,
+        n_positions=ds_args.max_position_embedding,
+        n_embd=ds_args.hidden_size,
+        n_layer=ds_args.num_layers,
+        n_head=ds_args.num_attention_heads,
+        n_inner=ds_args.ffn_hidden_size,
+        activation_function=activation_function,
+        attention_type=attention_type,
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        summary_type="cls_index",
+        summary_use_proj=True,
+        summary_activation=None,
+        summary_proj_to_labels=True,
+        summary_first_dropout=0.1,
+        scale_attn_weights=True,
+        use_cache=True,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        attention_softmax_in_fp32=attention_softmax_in_fp32,
+        scale_attention_softmax_in_fp32=True,
+    )
 
     # from pprint import pprint
     # pprint(vars(ds_args))
@@ -136,31 +132,17 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
         raise NotImplementedError(f"Checkpoint version {checkpoint_version} not supported.")
 
     # The model.
-    model = input_state_dict["model"]
-    # The language model.
-    lm = model["language_model"]
-    # The embeddings.
-    embeddings = lm["embedding"]
+    model = input_state_dict["model"]["language_model"]
 
-    # The word embeddings.
-    word_embeddings = embeddings["word_embeddings"]["weight"]
-    # Truncate the embedding table to vocab_size rows.
-    word_embeddings = word_embeddings[: config.vocab_size, :]
+    # The word embeddings, truncated to to vocab_size rows.
+    word_embeddings = model["embedding"]["word_embeddings"]["weight"][: config.vocab_size, :]
     output_state_dict["transformer.wte.weight"] = word_embeddings
 
     # The position embeddings.
-    pos_embeddings = embeddings["position_embeddings"]["weight"]
-    # Read the causal mask dimension (seqlen). [max_sequence_length, hidden_size]
-    n_positions = pos_embeddings.size(0)
-    if n_positions != config.n_positions:
-        raise ValueError(
-            f"pos_embeddings.max_sequence_length={n_positions} and config.n_positions={config.n_positions} don't match"
-        )
-    # Store the position embeddings.
-    output_state_dict["transformer.wpe.weight"] = pos_embeddings
+    output_state_dict["transformer.wpe.weight"] = model["embedding"]["position_embeddings"]["weight"]
 
     # The transformer.
-    transformer = lm["transformer"] if "transformer" in lm.keys() else lm["encoder"]
+    transformer = model["transformer"] if "transformer" in model else model["encoder"]
 
     # The regex to extract layer names.
     layer_re = re.compile("layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
@@ -203,7 +185,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
             output_state_dict[layer_name + "." + ln_name + "." + weight_or_bias] = val
 
         # Concatenate QKV matrix.
-        elif args.merge_qkv and (op_name == "self_attention.key_value"):
+        elif merge_qkv and (op_name == "self_attention.key_value"):
             # Query is before key_value in the dict.
             query = output_state_dict.pop(layer_name + ".attn.q_attn." + weight_or_bias)
             out_val = torch.cat([query, val], dim=0)
@@ -224,7 +206,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
     output_state_dict["lm_head.weight"] = word_embeddings
 
     # It should be done!
-    return output_state_dict
+    return config, output_state_dict
 
 
 ####################################################################################################
@@ -238,11 +220,6 @@ def main(argv=None):
         "path_to_checkpoint",
         type=str,
         help="Path to the checkpoint file (.zip archive or direct .pt file)",
-    )
-    parser.add_argument(
-        "--config_file",
-        type=str,
-        help="An optional config json file describing the pre-trained model.",
     )
     parser.add_argument(
         "--no_merge_qkv",
@@ -267,11 +244,9 @@ def main(argv=None):
     print(f"Extracting PyTorch state dictionary from {args.path_to_checkpoint}")
     input_state_dict = torch.load(args.path_to_checkpoint, map_location="cpu")
 
-    config = GPTBigCodeConfig.from_json_file(args.config_file) if args.config_file else None
-
     # Convert.
     print("Converting")
-    output_state_dict = convert_megatron_checkpoint(args, input_state_dict, config)
+    config, output_state_dict = convert_megatron_checkpoint(input_state_dict, args.merge_qkv)
 
     # Print the structure of converted state dict.
     if args.print_checkpoint_structure:
