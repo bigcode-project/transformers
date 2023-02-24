@@ -17,6 +17,7 @@
 import datetime
 import math
 import unittest
+from parameterized import parameterized
 
 from transformers import GPTBigCodeConfig, is_torch_available
 from transformers.testing_utils import require_torch, slow, torch_device
@@ -824,7 +825,8 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         )
         return GPTBigCodeAttention(config)
 
-    def prepare_mqa_correctness_test(self, seed, test_mode="train"):
+    @parameterized.expand([(seed, is_train_mode) for seed in range(5) for is_train_mode in [True, False]])
+    def test_mqa_correctness(self, seed, is_train_mode=True):
         torch.manual_seed(seed)
         embed_dim = 2048
         head_dim = 128
@@ -865,16 +867,9 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         attention_mq2.load_state_dict(state_dict_mq2)
 
         # PUT THE MODEL INTO THE CORRECT MODE
-        if test_mode == "eval":
-            attention_mh.eval()
-            attention_mq1.eval()
-            attention_mq2.eval()
-        elif test_mode == "train":
-            attention_mh.train()
-            attention_mq1.train()
-            attention_mq2.train()
-        else:
-            raise ValueError(f"test_mode must be train or eval, but found: {test_mode}")
+        attention_mh.train(is_train_mode)
+        attention_mq1.train(is_train_mode)
+        attention_mq2.train(is_train_mode)
 
         # RUN AN INPUT THROUGH THE MODELS
         num_tokens = 5
@@ -888,11 +883,3 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result, atol=tolerance))
         self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result, atol=tolerance))
         self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result, atol=tolerance))
-
-    def test_mqa_correctness_train(self):
-        for seed in range(5):
-            self.prepare_mqa_correctness_test(seed=seed, test_mode="train")
-
-    def test_mqa_correctness_eval(self):
-        for seed in range(5):
-            self.prepare_mqa_correctness_test(seed=seed, test_mode="eval")
