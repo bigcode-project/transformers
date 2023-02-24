@@ -357,8 +357,11 @@ class GPTBigCodeMLP(nn.Module):
         return hidden_states
 
 
+def _align_tensor(x):
+    return x + -x % 128
+
+
 class GPTBigCodeInferenceRunner:
-    # TODO: Use F.linear.
     def __init__(self, config: GPTBigCodeConfig, model):
         self.batch_size = None
         self.model = model
@@ -394,19 +397,37 @@ class GPTBigCodeInferenceRunner:
 
         hidden_end = self.batch_size * attn.embed_dim
         # Query: (bs, embed_dim), also used for attn outputs (no overlap with value).
-        query_end = hidden_end + self.batch_size * attn.embed_dim
+        query_begin = _align_tensor(hidden_end)
+        query_end = query_begin + self.batch_size * attn.embed_dim
         # KV: (bs, 2 * kv_dim), combines with query into c_attn.
         kv_end = query_end + 2 * self.batch_size * attn.kv_dim
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value
+        attn_weights_begin = _align_tensor(kv_end)
         attn_weights_end = kv_end + self.batch_size * attn.num_heads * self.max_sequence_length
         # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
         # Also used for MLP projection ()
-        c_proj_end = query_end + self.batch_size * attn.embed_dim
-        c_fc_end = hidden_end + self.batch_size * block.inner_dim
+        c_proj_begin = _align_tensor(query_end)
+        c_proj_end = c_proj_begin + self.batch_size * attn.embed_dim
+        c_fc_begin = query_begin
+        c_fc_end = c_fc_begin + self.batch_size * block.inner_dim
         pool_size = max(attn_weights_end, c_proj_end, c_fc_end)
+        kv_cache_shape = (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim)
+        kv_cache_size = math.prod(kv_cache_shape)
+
+        print(
+            f"Allocating inference buffers (batch size = {self.batch_size}, max sequence length ="
+            f" {self.max_sequence_length})..."
+        )
+        print(f"  Activation pool size: {pool_size:,}")
+        print(f"  KV cache size: {kv_cache_size:,}")
+        buffer_memory = (pool_size * kv_cache_size) * torch.finfo(
+            self.dtype
+        ).bits / 8 + self.batch_size * self.max_sequence_length
+        print(f"  Memory usage: {buffer_memory/2**20:.0f} MiB")
+
         activation_pool = torch.empty(pool_size, **factory_kwargs)
         kv_cache = torch.empty(
-            (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim),
+            kv_cache_shape,
             **factory_kwargs,
         )
         self.mask_value = torch.full(
@@ -414,6 +435,13 @@ class GPTBigCodeInferenceRunner:
         )
         # We ensure mask tensors are contiguous to enable more efficient kernels.
         attn_mask = torch.empty(self.batch_size * self.max_sequence_length, dtype=torch.bool, device=self.device)
+
+        if self.device.type == "cuda":
+            print(f"  Memory allocated {torch.cuda.memory_allocated()/2**20:.0f} MiB")
+            # Max stats give some insight on the prefill memory usage.
+            print(f"  Max memory allocated {torch.cuda.max_memory_allocated()/2**20:.0f} MiB")
+            print(f"  Max memory reserved {torch.cuda.max_memory_reserved()/2**20:.0f} MiB")
+
         self.attn_masks = [
             attn_mask[: self.batch_size * key_length].view(self.batch_size, 1, key_length)
             for key_length in range(self.max_sequence_length + 1)
@@ -423,7 +451,7 @@ class GPTBigCodeInferenceRunner:
         self.hidden_states_squeezed = activation_pool[:hidden_end].view(self.batch_size, -1)
         self.hidden_states = self.hidden_states_squeezed.unsqueeze(1)
         # QKV: (bs, embed_dim + 2 * kv_dim).
-        self.c_attn = activation_pool[hidden_end:kv_end].view(self.batch_size, -1)
+        self.c_attn = activation_pool[query_begin:kv_end].view(self.batch_size, -1)
         self.query = self.c_attn[:, : attn.embed_dim].view(self.batch_size, attn.num_heads, attn.head_dim)
         self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
@@ -444,21 +472,21 @@ class GPTBigCodeInferenceRunner:
         ]
 
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
-        attn_weights = activation_pool[kv_end:attn_weights_end].view(
+        attn_weights = activation_pool[attn_weights_begin:attn_weights_end].view(
             self.batch_size, attn.num_heads, self.max_sequence_length
         )
         self.attn_weights = [attn_weights[:, :, :key_length] for key_length in key_lengths]
 
         # Attn outputs: (batch_size, embed_dim), no overlap with value.
-        self.attn_output = activation_pool[hidden_end:query_end].view(self.batch_size, -1)
+        self.attn_output = activation_pool[query_begin:query_end].view(self.batch_size, -1)
         self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
         # Attn projection: (batch_size, embed_dim), no overlap with attn outputs.
-        self.c_proj = activation_pool[query_end:c_proj_end].view(self.batch_size, -1)
+        self.c_proj = activation_pool[c_proj_begin:c_proj_end].view(self.batch_size, -1)
 
         # MLP first layer: (batch_size, embed_dim)
-        self.mlp_c_fc = activation_pool[hidden_end:c_fc_end].view(self.batch_size, -1)
+        self.mlp_c_fc = activation_pool[c_fc_begin:c_fc_end].view(self.batch_size, -1)
         # MLP projection: (batch_size, inner_dim)
-        self.mlp_c_proj = activation_pool[hidden_end:query_end].view(self.batch_size, -1)
+        self.mlp_c_proj = activation_pool[query_begin:query_end].view(self.batch_size, -1)
 
         if self.inference_runner_type != InferenceRunnerType.BASE_RUNNER:
             print(f"Generating cuda graphs")
