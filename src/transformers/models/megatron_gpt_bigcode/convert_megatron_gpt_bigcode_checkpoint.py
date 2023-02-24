@@ -32,12 +32,9 @@
 # in your path, i.e., /path/to/Megatron-DeepSpeed/
 #
 
-# TODO: Update this file
-
 import argparse
 import os
 import re
-import zipfile
 
 import torch
 
@@ -67,109 +64,97 @@ def recursive_print(name, val, spaces=0):
         print(msg, ":", val)
 
 
-def fix_query_key_value_ordering(param, checkpoint_version, num_splits, num_heads, hidden_size):
-    # Permutes layout of param tensor to [num_splits * num_heads * hidden_size, :]
-    # for compatibility with later versions of NVIDIA Megatron-LM.
-    # The inverse operation is performed inside Megatron-LM to read checkpoints:
-    # https://github.com/NVIDIA/Megatron-LM/blob/v2.4/megatron/checkpointing.py#L209
-    # If param is the weight tensor of the self-attention block, the returned tensor
-    # will have to be transposed one more time to be read by HuggingFace GPT2.
-    input_shape = param.size()
-    if checkpoint_version == 1.0:
-        # version 1.0 stores [num_heads * hidden_size * num_splits, :]
-        saved_shape = (num_heads, hidden_size, num_splits) + input_shape[1:]
-        param = param.view(*saved_shape)
-        param = param.transpose(0, 2)
-        param = param.transpose(1, 2).contiguous()
-    elif checkpoint_version >= 2.0:
-        # other versions store [num_heads * num_splits * hidden_size, :]
-        saved_shape = (num_heads, num_splits, hidden_size) + input_shape[1:]
-        param = param.view(*saved_shape)
-        param = param.transpose(0, 1).contiguous()
-    param = param.view(*input_shape)
-    return param
-
-
 ####################################################################################################
 
+# The simple map of names for "automated" rules.
+NAME_MAP = {
+    "attention.dense": ".attn.c_proj.",
+    "self_attention.dense": ".attn.c_proj.",
+    "mlp.dense_h_to_4h": ".mlp.c_fc.",
+    "mlp.dense_4h_to_h": ".mlp.c_proj.",
+    "self_attention.query_key_value": ".attn.c_attn.",
+    "self_attention.query": ".attn.q_attn.",
+    "self_attention.key_value": ".attn.kv_attn.",
+}
 
-def convert_megatron_checkpoint(args, input_state_dict, config):
+def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     # The converted output model.
     output_state_dict = {}
+    ds_args = input_state_dict["args"]
 
-    # old versions did not store training args
-    ds_args = input_state_dict.get("args", None)
     if ds_args is not None:
-        # do not make the user write a config file when the exact dimensions/sizes are already in the checkpoint
-        # from pprint import pprint
-        # pprint(vars(ds_args))
-
-        config.vocab_size = ds_args.padded_vocab_size
-        config.n_positions = ds_args.max_position_embeddings
-        config.n_embd = ds_args.hidden_size
-        config.n_layer = ds_args.num_layers
-        config.n_head = ds_args.num_attention_heads
-        config.n_inner = ds_args.ffn_hidden_size
-
-        if ds_args.attention_head_type == "multihead":
-            # TODO: Adjust qkv layout (no need to fix_query_key_value_ordering anymore)
-            config.attention_type = 1
+        if ds_args.bias_gelu_fusion:
+            activation_function = "gelu_pytorch_tanh"
+        elif ds_args.openai_gelu:
+            activation_function = "gelu_new"
         else:
-            assert ds_args.attention_head_type == "multiquery"
-            config.attention_type = 2 if args.merge_qkv else 3
-
-        # also set `scale_attn_weights` and `scale_attn_by_inverse_layer_idx` ?
-        # Uncommenting the next line makes the converted model output different logits.
-        # config.scale_attn_by_inverse_layer_idx = ds_args.apply_query_key_layer_scaling
-        # pprint(config)
-
-    # The number of heads.
-    heads = config.n_head
-    # The hidden_size per head.
-    hidden_size_per_head = config.n_embd // config.n_head
-    # Megatron-LM checkpoint version
-    if "checkpoint_version" in input_state_dict.keys():
-        checkpoint_version = input_state_dict["checkpoint_version"]
+            activation_function = "gelu"
     else:
-        checkpoint_version = 0.0
+        # in the very early days this used to be "gelu_new"
+        activation_function = "gelu_new"
+
+    if ds_args.attention_head_type == "multihead":
+        attention_type = 1
+    else:
+        assert ds_args.attention_head_type == "multiquery"
+        attention_type = 2 if merge_qkv else 3
+
+    attention_softmax_in_fp32 = ds_args.attention_softmax_in_fp32 or ds_args.apply_query_key_layer_scaling
+
+    # Spell out all parameters in case the defaults change.
+    config = GPTBigCodeConfig(
+        architectures=["GPTBigCodeLMHeadModel"],
+        vocab_size=ds_args.padded_vocab_size,
+        n_positions=ds_args.max_position_embeddings,
+        n_embd=ds_args.hidden_size,
+        n_layer=ds_args.num_layers,
+        n_head=ds_args.num_attention_heads,
+        n_inner=ds_args.ffn_hidden_size,
+        activation_function=activation_function,
+        attention_type=attention_type,
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        summary_type="cls_index",
+        summary_use_proj=True,
+        summary_activation=None,
+        summary_proj_to_labels=True,
+        summary_first_dropout=0.1,
+        scale_attn_weights=True,
+        use_cache=True,
+        bos_token_id=50256,
+        eos_token_id=50256,
+        attention_softmax_in_fp32=attention_softmax_in_fp32,
+        scale_attention_softmax_in_fp32=True,
+    )
+
+    # from pprint import pprint
+    # pprint(vars(ds_args))
+    # pprint(config)
+
+    # Megatron-LM checkpoint version
+    checkpoint_version = input_state_dict["checkpoint_version"]
+    if checkpoint_version < 2.0:
+        raise NotImplementedError(f"Checkpoint version {checkpoint_version} not supported.")
 
     # The model.
-    model = input_state_dict["model"]
-    # The language model.
-    lm = model["language_model"]
-    # The embeddings.
-    embeddings = lm["embedding"]
+    model = input_state_dict["model"]["language_model"]
 
-    # The word embeddings.
-    word_embeddings = embeddings["word_embeddings"]["weight"]
-    # Truncate the embedding table to vocab_size rows.
-    word_embeddings = word_embeddings[: config.vocab_size, :]
+    # The word embeddings, truncated to to vocab_size rows.
+    word_embeddings = model["embedding"]["word_embeddings"]["weight"][: config.vocab_size, :]
     output_state_dict["transformer.wte.weight"] = word_embeddings
 
     # The position embeddings.
-    pos_embeddings = embeddings["position_embeddings"]["weight"]
-    # Read the causal mask dimension (seqlen). [max_sequence_length, hidden_size]
-    n_positions = pos_embeddings.size(0)
-    if n_positions != config.n_positions:
-        raise ValueError(
-            f"pos_embeddings.max_sequence_length={n_positions} and config.n_positions={config.n_positions} don't match"
-        )
-    # Store the position embeddings.
-    output_state_dict["transformer.wpe.weight"] = pos_embeddings
+    output_state_dict["transformer.wpe.weight"] = model["embedding"]["position_embeddings"]["weight"]
 
     # The transformer.
-    transformer = lm["transformer"] if "transformer" in lm.keys() else lm["encoder"]
+    transformer = model["transformer"] if "transformer" in model else model["encoder"]
 
     # The regex to extract layer names.
     layer_re = re.compile("layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
 
-    # The simple map of names for "automated" rules.
-    megatron_to_transformers = {
-        "attention.dense": ".attn.c_proj.",
-        "self_attention.dense": ".attn.c_proj.",
-        "mlp.dense_h_to_4h": ".mlp.c_fc.",
-        "mlp.dense_4h_to_h": ".mlp.c_proj.",
-    }
 
     # Extract the layers.
     for key, val in transformer.items():
@@ -196,75 +181,16 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
             ln_name = "ln_1" if op_name.startswith("input") else "ln_2"
             output_state_dict[layer_name + "." + ln_name + "." + weight_or_bias] = val
 
-        # Transpose the QKV matrix.
-        elif (
-            op_name == "attention.query_key_value" or op_name == "self_attention.query_key_value"
-        ) and weight_or_bias == "weight":
-            out_val = fix_query_key_value_ordering(val, checkpoint_version, 3, heads, hidden_size_per_head)
-            # Store.
-            output_state_dict[layer_name + ".attn.c_attn.weight"] = out_val
+        # Concatenate QKV matrix.
+        elif merge_qkv and (op_name == "self_attention.key_value"):
+            # Query is before key_value in the dict.
+            query = output_state_dict.pop(layer_name + ".attn.q_attn." + weight_or_bias)
+            out_val = torch.cat([query, val], dim=0)
+            output_state_dict[layer_name + ".attn.c_attn." + weight_or_bias] = out_val
 
-        # Tranpose the Q matrix (for MQA)
-        elif (op_name == "self_attention.query") and weight_or_bias == "weight":
-            out_val = fix_query_key_value_ordering(val, checkpoint_version, 1, heads, hidden_size_per_head)
-            # Store.
-            output_state_dict[layer_name + ".attn.q_attn.weight"] = out_val
-
-        # Tranpose the KV matrix (for MQA)
-        elif (op_name == "self_attention.key_value") and weight_or_bias == "weight":
-            # Key-values are shared across heads
-            out_val = fix_query_key_value_ordering(val, checkpoint_version, 2, 1, hidden_size_per_head)
-            if args.merge_qkv:
-                # Concatenate the tensors.
-                # Query is before key_value in the dict.
-                query = output_state_dict.pop(layer_name + ".attn.q_attn.weight")
-                out_val = torch.cat([query, out_val], dim=0)
-                output_state_dict[layer_name + ".attn.c_attn.weight"] = out_val
-            else:
-                # Store.
-                output_state_dict[layer_name + ".attn.kv_attn.weight"] = out_val
-
-        # Transpose the bias.
-        elif (
-            op_name == "attention.query_key_value" or op_name == "self_attention.query_key_value"
-        ) and weight_or_bias == "bias":
-
-            out_val = fix_query_key_value_ordering(val, checkpoint_version, 3, heads, hidden_size_per_head)
-            # Store. No change of shape.
-            output_state_dict[layer_name + ".attn.c_attn.bias"] = out_val
-
-        # Transpose the Q bias (MQA)
-        elif (op_name == "self_attention.query") and weight_or_bias == "bias":
-
-            out_val = fix_query_key_value_ordering(val, checkpoint_version, 1, heads, hidden_size_per_head)
-            # Store. No change of shape.
-            output_state_dict[layer_name + ".attn.q_attn.bias"] = out_val
-
-        # Transpose the KV bias (MQA)
-        elif (op_name == "self_attention.key_value") and weight_or_bias == "bias":
-
-            out_val = fix_query_key_value_ordering(val, checkpoint_version, 2, 1, hidden_size_per_head)
-            if args.merge_qkv:
-                # Concatenate the tensors.
-                # Query is before key_value in the dict.
-                query = output_state_dict.pop(layer_name + ".attn.q_attn.bias")
-                out_val = torch.cat([query, out_val], dim=0)
-                output_state_dict[layer_name + ".attn.c_attn.bias"] = out_val
-            else:
-                # Store. No change of shape.
-                output_state_dict[layer_name + ".attn.kv_attn.bias"] = out_val
-
-        # Copy the weights.
-        elif weight_or_bias == "weight":
-
-            out_name = megatron_to_transformers[op_name]
-            output_state_dict[layer_name + out_name + "weight"] = val
-
-        # Copy the bias.
-        elif weight_or_bias == "bias":
-
-            out_name = megatron_to_transformers[op_name]
-            output_state_dict[layer_name + out_name + "bias"] = val
+        # Copy the parameters.
+        else:
+            output_state_dict[layer_name + NAME_MAP[op_name] + weight_or_bias] = val
 
     # DEBUG.
     assert config.n_layer == layer_idx + 1
@@ -277,7 +203,7 @@ def convert_megatron_checkpoint(args, input_state_dict, config):
     output_state_dict["lm_head.weight"] = word_embeddings
 
     # It should be done!
-    return output_state_dict
+    return config, output_state_dict
 
 
 ####################################################################################################
@@ -291,12 +217,6 @@ def main(argv=None):
         "path_to_checkpoint",
         type=str,
         help="Path to the checkpoint file (.zip archive or direct .pt file)",
-    )
-    parser.add_argument(
-        "--config_file",
-        default="",
-        type=str,
-        help="An optional config json file describing the pre-trained model.",
     )
     parser.add_argument(
         "--no_merge_qkv",
@@ -318,86 +238,16 @@ def main(argv=None):
     basename = args.save_dir or os.path.dirname(args.path_to_checkpoint)
 
     # Load the model.
-    # the .zip is very optional, let's keep it for backward compatibility
     print(f"Extracting PyTorch state dictionary from {args.path_to_checkpoint}")
-    if args.path_to_checkpoint.endswith(".zip"):
-        with zipfile.ZipFile(args.path_to_checkpoint, "r") as checkpoint:
-            with checkpoint.open("release/mp_rank_00/model_optim_rng.pt") as pytorch_dict:
-                input_state_dict = torch.load(pytorch_dict, map_location="cpu")
-    else:
-        input_state_dict = torch.load(args.path_to_checkpoint, map_location="cpu")
-
-    ds_args = input_state_dict.get("args", None)
-
-    # Read the config, or default to the model released by NVIDIA.
-    if args.config_file == "":
-        # TODO: FP32 softmax
-
-        if ds_args is not None:
-            if ds_args.bias_gelu_fusion:
-                # TODO: This will be in the next release of transformers (4.27).
-                activation_function = "gelu_pytorch_tanh"
-            elif ds_args.openai_gelu:
-                activation_function = "gelu_new"
-            else:
-                activation_function = "gelu"
-        else:
-            # in the very early days this used to be "gelu_new"
-            activation_function = "gelu_new"
-
-        # Spell out all parameters in case the defaults change.
-        config = GPTBigCodeConfig(
-            vocab_size=50257,
-            n_positions=1024,
-            n_embd=1024,
-            n_layer=24,
-            n_head=16,
-            n_inner=4096,
-            activation_function=activation_function,
-            resid_pdrop=0.1,
-            embd_pdrop=0.1,
-            attn_pdrop=0.1,
-            layer_norm_epsilon=1e-5,
-            initializer_range=0.02,
-            summary_type="cls_index",
-            summary_use_proj=True,
-            summary_activation=None,
-            summary_proj_to_labels=True,
-            summary_first_dropout=0.1,
-            scale_attn_weights=True,
-            use_cache=True,
-            bos_token_id=50256,
-            eos_token_id=50256,
-        )
-    else:
-        config = GPTBigCodeConfig.from_json_file(args.config_file)
-
-    config.architectures = ["GPTBigCodeLMHeadModel"]
+    input_state_dict = torch.load(args.path_to_checkpoint, map_location="cpu")
 
     # Convert.
     print("Converting")
-    output_state_dict = convert_megatron_checkpoint(args, input_state_dict, config)
+    config, output_state_dict = convert_megatron_checkpoint(input_state_dict, args.merge_qkv)
 
     # Print the structure of converted state dict.
     if args.print_checkpoint_structure:
         recursive_print(None, output_state_dict)
-
-    # Add tokenizer class info to config
-    # see https://github.com/huggingface/transformers/issues/13906)
-    # if ds_args is not None:
-    #     tokenizer_type = ds_args.tokenizer_type
-    #     if tokenizer_type == "GPT2BPETokenizer":
-    #         tokenizer_model_name = "gpt2"
-    #     elif tokenizer_type == "PretrainedFromHF":
-    #         tokenizer_model_name = ds_args.tokenizer_name_or_path
-    #     else:
-    #         raise ValueError(f"Unrecognized tokenizer_type {tokenizer_type}")
-    # else:
-    #     tokenizer_model_name = "gpt2"
-
-    # tokenizer = AutoTokenizer.from_pretrained(tokenizer_model_name)
-    # tokenizer_class = type(tokenizer).__name__
-    # config.tokenizer_class = tokenizer_class
 
     if args.custom_model:
         # Save custom model
@@ -411,10 +261,6 @@ def main(argv=None):
         # Store the config to file.
         print("Saving config")
         config.save_pretrained(basename)
-
-        # Save tokenizer based on args
-        # print(f"Adding {tokenizer_class} tokenizer files")
-        # tokenizer.save_pretrained(basename)
 
         # Store the state_dict to file.
         output_checkpoint_file = os.path.join(basename, "pytorch_model.bin")
