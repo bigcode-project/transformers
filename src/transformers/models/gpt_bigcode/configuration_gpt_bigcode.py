@@ -15,7 +15,7 @@
 # limitations under the License.
 """ OpenAI GPT-2 configuration"""
 from collections import OrderedDict
-from enum import Enum
+from enum import IntEnum
 from typing import Any, List, Mapping, Optional
 
 from transformers import PreTrainedTokenizer, TensorType, is_torch_available
@@ -31,7 +31,7 @@ GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP = {
 }
 
 
-class AttentionType(Enum):
+class AttentionType(IntEnum):
     MULTI_HEAD = 1
     MULTI_QUERY_1 = 2
     MULTI_QUERY_2 = 3
