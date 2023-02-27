@@ -77,6 +77,7 @@ NAME_MAP = {
     "self_attention.key_value": ".attn.kv_attn.",
 }
 
+
 def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     # The converted output model.
     output_state_dict = {}
@@ -154,7 +155,6 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
 
     # The regex to extract layer names.
     layer_re = re.compile("layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
-
 
     # Extract the layers.
     for key, val in transformer.items():
