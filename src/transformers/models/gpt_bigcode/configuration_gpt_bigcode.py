@@ -210,8 +210,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        # Convert to an int so it's JSON-serializable.
-        self.attention_type = AttentionType(attention_type).value
+        self.attention_type = AttentionType(attention_type)
 
         self.inference_runner = InferenceRunnerType(inference_runner).value
         # Set to False to disable input validation of safe inputs, for a small speedup.
