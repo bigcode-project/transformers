@@ -37,7 +37,7 @@ class AttentionType(IntEnum):
     MULTI_QUERY_2 = 3
 
 
-class InferenceRunnerType(Enum):
+class InferenceRunnerType(IntEnum):
     NO_RUNNER = 0
     # Use the inference runner without cuda graphs.
     BASE_RUNNER = 1
@@ -212,7 +212,7 @@ class GPTBigCodeConfig(PretrainedConfig):
 
         self.attention_type = AttentionType(attention_type)
 
-        self.inference_runner = InferenceRunnerType(inference_runner).value
+        self.inference_runner = InferenceRunnerType(inference_runner)
         # Set to False to disable input validation of safe inputs, for a small speedup.
         self.validate_runner_input = validate_runner_input
         # Set if `n_positions` uses too much memory.
