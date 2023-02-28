@@ -150,9 +150,15 @@ class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         self.mask_value = None
+        self.kv_cache = None
+        self.kv_cache_batch_size = config.max_batch_size or 0
+        self.kv_cache_max_sequence_length = config.max_sequence_length or config.n_position
 
         self.attention_type = AttentionType(config.attention_type)
         self.is_mqa = self.attention_type != AttentionType.MULTI_HEAD
+
+        self.pre_allocate_kv_cache = config.pre_allocate_kv_cache
+        self.pad_key_length = config.pad_key_length and config.pre_allocate_kv_cache
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -284,6 +290,28 @@ class GPTBigCodeAttention(nn.Module):
 
         return attn_output, attn_weights
 
+    def _get_kv_cache(self, batch_size, sequence_length, device, dtype, allocate=True):
+        if (
+            self.kv_cache is None
+            or self.kv_cache.dtype != dtype
+            or self.kv_cache.device != device
+            or batch_size > self.kv_cache_max_batch_size
+            or sequence_length > self.kv_cache_max_sequence_length
+        ):
+            if not allocate:
+                raise RuntimeError("Cannot recover KV cache")
+            # Free memory first.
+            self.kv_cache = None
+            self.kv_cache_max_sequence_length = max(sequence_length, self.kv_cache_max_sequence_length)
+            self.kv_cache_max_batch_size = max(batch_size, self.kv_cache_max_batch_size)
+            kv_cache_size = 2 * self.kv_cache_max_batch_size * self.kv_cache_max_sequence_length * self.kv_dim
+            self.kv_cache = torch.empty([kv_cache_size], device=device, dtype=dtype)
+        # This view ensures the cache is contiguous for all batch sizes.
+        kv_cache = self.kv_cache[: 2 * batch_size * self.kv_cache_max_sequence_length * self.kv_dim].view(
+            batch_size, self.kv_heads, self.kv_cache_max_sequence_length, 2 * self.head_dim
+        )
+        return kv_cache[:, 0, :sequence_length, :] if self.is_mqa else kv_cache[:, :, :sequence_length, :]
+
     def forward(
         self,
         hidden_states: torch.FloatTensor,
@@ -321,8 +349,27 @@ class GPTBigCodeAttention(nn.Module):
                 .split((self.head_dim, 2 * self.head_dim), dim=3)
             )
 
-        if layer_past is not None:
-            key_value = torch.cat((layer_past, key_value), dim=-2)
+        present = None
+
+        if self.pre_allocate_kv_cache:
+            if use_cache or layer_past is not None:
+                last_key_length = layer_past or 0
+                batch_size = key_value.size(0)
+                key_length = last_key_length + key_value.size(-2)
+                padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
+                kv_cache = self._get_kv_cache(
+                    batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
+                )
+                if self.is_mqa:
+                    kv_cache[:, last_key_length:key_length, :].copy_(key_value)
+                key_value = kv_cache
+                if use_cache:
+                    present = key_length
+        else:
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            if use_cache:
+                present = key_value
 
         key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
@@ -334,7 +381,7 @@ class GPTBigCodeAttention(nn.Module):
         attn_output = self.resid_dropout(attn_output)
 
         # TODO: Is it ok to send unwrapped present?
-        outputs = (attn_output, key_value if use_cache else None)
+        outputs = (attn_output, present)
         if output_attentions:
             outputs += (attn_weights,)
 
@@ -683,6 +730,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
+        self.pad_key_length = config.pad_key_length and config.pre_allocate_kv_cache
+
         self.inference_runner_type = InferenceRunnerType(config.inference_runner)
 
         if self.inference_runner_type == InferenceRunnerType.NO_RUNNER:
@@ -845,6 +894,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         # MQA: (b, sq, nh, sk)
         # MHA: (b, nh, sq, sk)
         attention_mask = self_attention_mask.unsqueeze(2 if self.is_mqa else 1)
+
+        if self.pad_key_length:
+            pad = -key_length % 8
+            if pad > 0:
+                attention_mask = torch.nn.functional.pad(attention_mask, (0, pad), mode="constant", value=False)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
