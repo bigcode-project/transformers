@@ -101,7 +101,7 @@ class GPTBigCodeModelTester:
         self.pad_token_id = vocab_size - 1
 
     def get_large_model_config(self):
-        return GPTBigCodeConfig.from_pretrained("gpt2")
+        return GPTBigCodeConfig.from_pretrained("bigcode/santacoder-fast-inference")
 
     def prepare_config_and_inputs(
         self, gradient_checkpointing=False, scale_attn_by_inverse_layer_idx=False, reorder_and_upcast_attn=False
@@ -537,9 +537,9 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
 
     @slow
     def test_batch_generation(self):
-        model = GPTBigCodeLMHeadModel.from_pretrained("gpt2")
+        model = GPTBigCodeLMHeadModel.from_pretrained("bigcode/santacoder-fast-inference")
         model.to(torch_device)
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("bigcode/santacoder")
 
         tokenizer.padding_side = "left"
 
@@ -596,9 +596,9 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
 
     @slow
     def test_batch_generation_2heads(self):
-        model = GPTBigCodeDoubleHeadsModel.from_pretrained("gpt2")
+        model = GPTBigCodeDoubleHeadsModel.from_pretrained("bigcode/santacoder-fast-inference")
         model.to(torch_device)
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("bigcode/santacoder")
 
         tokenizer.padding_side = "left"
 
@@ -671,7 +671,7 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
         verify_outputs=True,
     ):
         model = GPTBigCodeLMHeadModel.from_pretrained(
-            "gpt2",
+            "bigcode/santacoder-fast-inference",
             reorder_and_upcast_attn=reorder_and_upcast_attn,
             scale_attn_by_inverse_layer_idx=scale_attn_by_inverse_layer_idx,
         )
@@ -712,8 +712,8 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
 
     @slow
     def test_gpt_bigcode_sample(self):
-        tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        model = GPTBigCodeLMHeadModel.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("bigcode/santacoder")
+        model = GPTBigCodeLMHeadModel.from_pretrained("bigcode/santacoder-fast-inference")
         model.to(torch_device)
 
         torch.manual_seed(0)
@@ -740,8 +740,8 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
 
     @slow
     def test_gpt_bigcode_sample_max_time(self):
-        tokenizer = GPTBigCodeTokenizer.from_pretrained("gpt2")
-        model = GPTBigCodeLMHeadModel.from_pretrained("gpt2")
+        tokenizer = GPT2Tokenizer.from_pretrained("bigcode/santacoder")
+        model = GPTBigCodeLMHeadModel.from_pretrained("bigcode/santacoder-fast-inference")
         model.to(torch_device)
 
         torch.manual_seed(0)
@@ -786,8 +786,8 @@ class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
             "laboratory founded in 2010. DeepMind was acquired by Google in 2014. The company is based"
         )
 
-        gpt_bigcode_tokenizer = GPT2Tokenizer.from_pretrained("gpt2-large")
-        gpt_bigcode_model = GPTBigCodeLMHeadModel.from_pretrained("gpt2-large").to(torch_device)
+        gpt_bigcode_tokenizer = GPT2Tokenizer.from_pretrained("bigcode/santacoder")
+        gpt_bigcode_model = GPTBigCodeLMHeadModel.from_pretrained("bigcode/santacoder-fast-inference").to(torch_device)
         input_ids = gpt_bigcode_tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
 
         outputs = gpt_bigcode_model.generate(input_ids, penalty_alpha=0.6, top_k=4, max_length=256)

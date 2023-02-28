@@ -52,9 +52,7 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "gpt_bigcode"
 _CONFIG_FOR_DOC = "GPTBigCodeConfig"
 
-GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
-    # TODO: Add support for santa models.
-]
+GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = ["bigcode/santacoder-fast-inference"]
 
 # Fused kernels
 # Use separate functions for each case because conditionals prevent kernel fusion.
