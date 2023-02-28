@@ -6,7 +6,7 @@ import torch
 from transformers import GPTBigCodeConfig
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.gpt_bigcode.configuration_gpt_bigcode import AttentionType, InferenceRunnerType
-from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, upcast_masked_softmax
+from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, masked_softmax, upcast_masked_softmax
 
 
 def _align_tensor(x):
@@ -22,18 +22,16 @@ class GPTBigCodeInferenceRunner:
         self.inference_runner_type = InferenceRunnerType(config.inference_runner)
         assert self.inference_runner_type != InferenceRunnerType.NO_RUNNER
         self.validate_input = config.validate_runner_input
+        self.pad_key_length = 8 if config.pad_key_length else 1
 
         # TODO: Support other attention types?
         assert model.attention_type == AttentionType.MULTI_QUERY_1
 
         self.max_sequence_length = config.runner_max_sequence_length or config.n_positions
-        # self.max_batch_size=None
 
     def _allocate(self, batch_size, device, dtype):
         block: GPTBigCodeBlock = self.model.h[0]
         attn = block.attn
-        if not attn.is_mqa:
-            raise NotImplementedError()
         self.batch_size = batch_size
         self.dtype = dtype
         self.device = device
@@ -72,7 +70,7 @@ class GPTBigCodeInferenceRunner:
         )
         print(f"  Activation pool size: {pool_size:,}")
         print(f"  KV cache size: {kv_cache_size:,}")
-        buffer_memory = (pool_size * kv_cache_size) * torch.finfo(
+        buffer_memory = (pool_size + kv_cache_size) * torch.finfo(
             self.dtype
         ).bits / 8 + self.batch_size * self.max_sequence_length
         print(f"  Memory usage: {buffer_memory/2**20:.0f} MiB")
@@ -94,9 +92,20 @@ class GPTBigCodeInferenceRunner:
             print(f"  Max memory allocated {torch.cuda.max_memory_allocated()/2**20:.0f} MiB")
             print(f"  Max memory reserved {torch.cuda.max_memory_reserved()/2**20:.0f} MiB")
 
-        self.attn_masks = [
+        key_lengths = range(self.max_sequence_length + 1)
+        padded_key_lengths = [key_length + -key_length % self.pad_key_length for key_length in key_lengths]
+
+        self.padded_attn_masks = [
             attn_mask[: self.batch_size * key_length].view(self.batch_size, 1, key_length)
-            for key_length in range(self.max_sequence_length + 1)
+            for key_length in padded_key_lengths
+        ]
+        self.attn_masks = [
+            padded_attn_mask[:, :, :key_length].squeeze(1)
+            for key_length, padded_attn_mask in enumerate(self.padded_attn_masks)
+        ]
+        self.attn_mask_pads = [
+            padded_attn_mask[:, :, key_length:].squeeze(1)
+            for key_length, padded_attn_mask in enumerate(self.padded_attn_masks)
         ]
 
         # Hidden: (batch_size, 1, embed_dim), no overlap allowed.
@@ -110,10 +119,9 @@ class GPTBigCodeInferenceRunner:
         key, value = kv_cache.split((attn.head_dim, attn.head_dim), dim=-1)
         key = key.transpose(-1, -2)
         head_slice = 0 if attn.is_mqa else slice(None)
-        key_lengths = range(self.max_sequence_length + 1)
 
-        self.keys = [key[:, :, head_slice, :, :key_length].unbind(0) for key_length in key_lengths]
-        self.values = [value[:, :, head_slice, :key_length, :].unbind(0) for key_length in key_lengths]
+        self.padded_keys = [key[:, :, head_slice, :, :key_length].unbind(0) for key_length in padded_key_lengths]
+        self.padded_values = [value[:, :, head_slice, :key_length, :].unbind(0) for key_length in padded_key_lengths]
 
         # This is nonsense for key_length == 0, but we never need the value.
         self.current_key_values = [
@@ -127,7 +135,7 @@ class GPTBigCodeInferenceRunner:
         attn_weights = activation_pool[attn_weights_begin:attn_weights_end].view(
             self.batch_size, attn.num_heads, self.max_sequence_length
         )
-        self.attn_weights = [attn_weights[:, :, :key_length] for key_length in key_lengths]
+        self.padded_attn_weights = [attn_weights[:, :, :key_length] for key_length in padded_key_lengths]
 
         # Attn outputs: (batch_size, embed_dim), no overlap with value.
         self.attn_output = activation_pool[query_begin:query_end].view(self.batch_size, -1)
@@ -175,12 +183,18 @@ class GPTBigCodeInferenceRunner:
         if self.upcast:
             for scale in (1.0, 2.0):
                 upcast_masked_softmax(
-                    self.attn_weights[key_length],
-                    self.attn_masks[key_length],
+                    self.padded_attn_weights[key_length],
+                    self.padded_attn_masks[key_length],
                     self.mask_value,
                     scale,
                     self.softmax_dtype,
                 )
+        else:
+            masked_softmax(
+                self.padded_attn_weights[key_length],
+                self.padded_attn_masks[key_length],
+                self.mask_value,
+            )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.memory_pool):
             self.output_hidden_states[key_length] = self._forward(key_length)
@@ -205,29 +219,33 @@ class GPTBigCodeInferenceRunner:
         )
 
     def _forward_attn(self, block, key_length):
+
         layer_idx = block.attn.layer_idx
         self.current_key_values[key_length][layer_idx].copy_(self.kv_attn)
-        attn_weights = self.attn_weights[key_length]
+        attn_weights = self.padded_attn_weights[key_length]
+
         torch.baddbmm(
             attn_weights,
             self.query,
-            self.keys[key_length][layer_idx],
+            self.padded_keys[key_length][layer_idx],
             beta=0,
             alpha=self.scale[layer_idx],
             out=attn_weights,
         )
+        # Use a fused kernel to prevent a large overhead from casting and scaling.
+        # Jit doesn't allow inplace kernel.
         if self.upcast:
-            # Use a fused kernel to prevent a large overhead from casting and scaling.
-            # Jit doesn't allow inplace kernel.
             attn_weights = upcast_masked_softmax(
-                attn_weights, self.attn_masks[key_length], self.mask_value, self.unscale[layer_idx], self.softmax_dtype
+                attn_weights,
+                self.padded_attn_masks[key_length],
+                self.mask_value,
+                self.unscale[layer_idx],
+                self.softmax_dtype,
             )
         else:
-            # This can be fused, but the fused kernel seems slower.
-            torch.where(self.attn_masks[key_length], attn_weights, self.mask_value, out=attn_weights)
-            torch.softmax(attn_weights, dim=-1, out=attn_weights)
+            attn_weights = masked_softmax(attn_weights, self.padded_attn_masks[key_length], self.mask_value)
 
-        torch.bmm(attn_weights, self.values[key_length][layer_idx], out=self.attn_output_expanded)
+        torch.bmm(attn_weights, self.padded_values[key_length][layer_idx], out=self.attn_output_expanded)
 
     def _forward_post_attn(self, block):
         torch.nn.functional.linear(
@@ -288,10 +306,13 @@ class GPTBigCodeInferenceRunner:
             for buffer, past_key_value in zip(self.past_key_values[key_length], past_key_values):
                 buffer.copy_(past_key_value)
 
-        # Copy gives a fixed position and replaces conversion to bool.
-        self.attn_masks[key_length].copy_(attention_mask.unsqueeze(1))
-
         self._forward_embed(input_ids, position_ids)
+
+        self.attn_masks[key_length].copy_(attention_mask)
+
+        attn_mask_pad = self.attn_mask_pads[key_length]
+        if attn_mask_pad.size(1) > 0:
+            attn_mask_pad.fill_(False)
 
         if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
             if key_length not in self.cuda_graphs:

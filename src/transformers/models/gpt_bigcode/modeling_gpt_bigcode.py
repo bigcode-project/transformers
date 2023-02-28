@@ -258,6 +258,7 @@ class GPTBigCodeAttention(nn.Module):
 
         if upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
+            # Sub-optimal when the key length is not a multiple of 8.
             if attention_mask is None:
                 attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
             else:
@@ -266,7 +267,7 @@ class GPTBigCodeAttention(nn.Module):
         else:
             if attention_mask is not None:
                 mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-                # This can be fused with the softmax, but the fused kernel seems slower.
+                # The fused kernel is very slow when the key length is not a multiple of 8, so we skip fusion.
                 attn_weights = torch.where(attention_mask, attn_weights, mask_value)
             attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 

@@ -183,6 +183,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         inference_runner=InferenceRunnerType.NO_RUNNER,
         validate_runner_input=True,
         runner_max_sequence_length=None,
+        pad_key_length=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -217,6 +218,8 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.validate_runner_input = validate_runner_input
         # Set if `n_positions` uses too much memory.
         self.runner_max_sequence_length = runner_max_sequence_length
+        # Pad key length to a multiple of 8.
+        self.pad_key_length = pad_key_length
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
