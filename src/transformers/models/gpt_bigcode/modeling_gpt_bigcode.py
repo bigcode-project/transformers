@@ -151,14 +151,15 @@ class GPTBigCodeAttention(nn.Module):
         super().__init__()
         self.mask_value = None
         self.kv_cache = None
-        self.kv_cache_batch_size = config.max_batch_size or 0
-        self.kv_cache_max_sequence_length = config.max_sequence_length or config.n_position
+        self.kv_cache_max_batch_size = config.max_batch_size or 0
+        self.kv_cache_max_sequence_length = config.max_sequence_length or config.n_positions
 
         self.attention_type = AttentionType(config.attention_type)
         self.is_mqa = self.attention_type != AttentionType.MULTI_HEAD
 
         self.pre_allocate_kv_cache = config.pre_allocate_kv_cache
         self.pad_key_length = config.pad_key_length and config.pre_allocate_kv_cache
+        self._frozen_kv_cache = False
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -260,8 +261,6 @@ class GPTBigCodeAttention(nn.Module):
             torch.empty(attn_view, dtype=query.dtype, device=query.device), query, key, beta=0, alpha=scale_factor
         ).view(attn_shape)
 
-        # attn_weights = self._matmul(query, key, scale_factor=scale_factor)
-
         if upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
             # Sub-optimal when the key length is not a multiple of 8.
@@ -290,7 +289,13 @@ class GPTBigCodeAttention(nn.Module):
 
         return attn_output, attn_weights
 
-    def _get_kv_cache(self, batch_size, sequence_length, device, dtype, allocate=True):
+    def freeze_kv_cache(self, enable=True):
+        if self.kv_cache is None:
+            raise RuntimeError("KV cache not found.")
+        # Prevent re-allocation of the KV cache.
+        self._frozen_kv_cache = enable
+
+    def get_kv_cache(self, batch_size, sequence_length, device, dtype, allocate=True):
         if (
             self.kv_cache is None
             or self.kv_cache.dtype != dtype
@@ -298,8 +303,9 @@ class GPTBigCodeAttention(nn.Module):
             or batch_size > self.kv_cache_max_batch_size
             or sequence_length > self.kv_cache_max_sequence_length
         ):
-            if not allocate:
-                raise RuntimeError("Cannot recover KV cache")
+            if self._frozen_kv_cache or not allocate:
+                # TODO: Improve error message
+                raise RuntimeError("KV cache not found." if self.kv_cache is None else "Invalid KV cache.")
             # Free memory first.
             self.kv_cache = None
             self.kv_cache_max_sequence_length = max(sequence_length, self.kv_cache_max_sequence_length)
@@ -357,7 +363,7 @@ class GPTBigCodeAttention(nn.Module):
                 batch_size = key_value.size(0)
                 key_length = last_key_length + key_value.size(-2)
                 padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
-                kv_cache = self._get_kv_cache(
+                kv_cache = self.get_kv_cache(
                     batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
                 )
                 if self.is_mqa:
@@ -730,7 +736,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
-        self.pad_key_length = config.pad_key_length and config.pre_allocate_kv_cache
+        self.pre_allocate_kv_cache = config.pre_allocate_kv_cache
+        self.pad_key_length = config.pad_key_length and self.pre_allocate_kv_cache
 
         self.inference_runner_type = InferenceRunnerType(config.inference_runner)
 
@@ -878,8 +885,10 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         if past_key_values is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.h))
+        elif self.pre_allocate_kv_cache:
+            past_length = past_key_values[0]
         else:
-            past_length = past_key_values[0][0].size(-2)
+            past_length = past_key_values[0].size(-2)
         if position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
