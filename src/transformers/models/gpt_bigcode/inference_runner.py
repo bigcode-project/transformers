@@ -21,13 +21,14 @@ class GPTBigCodeInferenceRunner:
 
         self.inference_runner_type = InferenceRunnerType(config.inference_runner)
         assert self.inference_runner_type != InferenceRunnerType.NO_RUNNER
+        assert config.pre_allocate_kv_cache
         self.validate_input = config.validate_runner_input
         self.pad_key_length = 8 if config.pad_key_length else 1
 
         # TODO: Support other attention types?
         assert model.attention_type == AttentionType.MULTI_QUERY_1
 
-        self.max_sequence_length = config.runner_max_sequence_length or config.n_positions
+        self.max_sequence_length = config.max_sequence_length or config.n_positions
 
     def _allocate(self, batch_size, device, dtype):
         block: GPTBigCodeBlock = self.model.h[0]
@@ -55,19 +56,28 @@ class GPTBigCodeInferenceRunner:
         attn_weights_begin = _align_tensor(kv_end)
         attn_weights_end = kv_end + self.batch_size * attn.num_heads * self.max_sequence_length
         # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
-        # Also used for MLP projection ()
+        # Also used for MLP projection
         c_proj_begin = _align_tensor(query_end)
         c_proj_end = c_proj_begin + self.batch_size * attn.embed_dim
         c_fc_begin = query_begin
         c_fc_end = c_fc_begin + self.batch_size * block.inner_dim
         pool_size = max(attn_weights_end, c_proj_end, c_fc_end)
-        kv_cache_shape = (self.n_layer, self.batch_size, attn.kv_heads, self.max_sequence_length, 2 * attn.head_dim)
-        kv_cache_size = math.prod(kv_cache_shape)
 
         print(
             f"Allocating inference buffers (batch size = {self.batch_size}, max sequence length ="
             f" {self.max_sequence_length})..."
         )
+
+        kv_caches = []
+        for block in self.model.h:
+            block.attn.freeze_kv_cache()
+            kv_cache=block.attn.get_kv_cache(self.batch_size, self.max_sequence_length, self.device, self.dtype)
+            if attn.is_mqa:
+                kv_cache=kv_cache.unsqueeze(1)
+            kv_caches.append(kv_cache)
+
+        kv_cache_size = sum(kv_cache.numel() for kv_cache in kv_caches)
+
         print(f"  Activation pool size: {pool_size:,}")
         print(f"  KV cache size: {kv_cache_size:,}")
         buffer_memory = (pool_size + kv_cache_size) * torch.finfo(
@@ -76,10 +86,6 @@ class GPTBigCodeInferenceRunner:
         print(f"  Memory usage: {buffer_memory/2**20:.0f} MiB")
 
         activation_pool = torch.empty(pool_size, **factory_kwargs)
-        kv_cache = torch.empty(
-            kv_cache_shape,
-            **factory_kwargs,
-        )
         self.mask_value = torch.full(
             [], torch.finfo(self.softmax_dtype).min, dtype=self.softmax_dtype, device=self.device
         )
@@ -116,19 +122,22 @@ class GPTBigCodeInferenceRunner:
         self.query = self.c_attn[:, : attn.embed_dim].view(self.batch_size, attn.num_heads, attn.head_dim)
         self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
-        key, value = kv_cache.split((attn.head_dim, attn.head_dim), dim=-1)
-        key = key.transpose(-1, -2)
+        keys, values = zip(*(kv_cache.split((attn.head_dim, attn.head_dim), dim=-1) for kv_cache in kv_caches))
         head_slice = 0 if attn.is_mqa else slice(None)
 
-        self.padded_keys = [key[:, :, head_slice, :, :key_length].unbind(0) for key_length in padded_key_lengths]
-        self.padded_values = [value[:, :, head_slice, :key_length, :].unbind(0) for key_length in padded_key_lengths]
+        self.padded_keys = [
+            [key[:, head_slice, :key_length, :].transpose(-1, -2) for key in keys] for key_length in padded_key_lengths
+        ]
+        self.padded_values = [
+            [value[:, head_slice, :key_length, :] for value in values] for key_length in padded_key_lengths
+        ]
 
         # This is nonsense for key_length == 0, but we never need the value.
         self.current_key_values = [
-            kv_cache[:, :, head_slice, key_length - 1, :].unbind(0) for key_length in key_lengths
+            [kv_cache[:, head_slice, key_length - 1, :] for kv_cache in kv_caches] for key_length in key_lengths
         ]
         self.past_key_values = [
-            kv_cache[:, :, head_slice, : key_length - 1, :].unbind(0) for key_length in key_lengths
+            [kv_cache[:, head_slice, : key_length - 1, :] for kv_cache in kv_caches] for key_length in key_lengths
         ]
 
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
@@ -301,10 +310,6 @@ class GPTBigCodeInferenceRunner:
                 assert key_length == past_key_values + 1
         else:
             key_length = attention_mask.shape[1]
-
-        if not isinstance(past_key_values, int):
-            for buffer, past_key_value in zip(self.past_key_values[key_length], past_key_values):
-                buffer.copy_(past_key_value)
 
         self._forward_embed(input_ids, position_ids)
 

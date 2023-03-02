@@ -184,7 +184,9 @@ class GPTBigCodeConfig(PretrainedConfig):
         attention_type=AttentionType.MULTI_HEAD,
         inference_runner=InferenceRunnerType.NO_RUNNER,
         validate_runner_input=True,
-        runner_max_sequence_length=None,
+        pre_allocate_kv_cache=False,
+        max_sequence_length=None,
+        max_batch_size=None,
         pad_key_length=True,
         **kwargs,
     ):
@@ -218,9 +220,13 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.inference_runner = InferenceRunnerType(inference_runner)
         # Set to False to disable input validation of safe inputs, for a small speedup.
         self.validate_runner_input = validate_runner_input
-        # Set if `n_positions` uses too much memory.
-        self.runner_max_sequence_length = runner_max_sequence_length
-        # Pad key length to a multiple of 8.
+
+        self.pre_allocate_kv_cache = pre_allocate_kv_cache
+        # The max sequence length for the pre-allocated KV cache (`n_positions` if not provided).
+        self.max_sequence_length = max_sequence_length
+        # The max batch size for the pre-allocated KV cache, (deduce from input if not provided).
+        self.max_batch_size = max_batch_size
+        # Pad key length to a multiple of 8 (requires pre_allocate_kv_cache).
         self.pad_key_length = pad_key_length
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
