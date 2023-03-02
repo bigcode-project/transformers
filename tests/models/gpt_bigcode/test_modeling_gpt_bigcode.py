@@ -17,8 +17,8 @@
 import datetime
 import math
 import unittest
-from parameterized import parameterized
 
+from parameterized import parameterized
 from transformers import GPTBigCodeConfig, is_torch_available
 from transformers.testing_utils import require_torch, slow, torch_device
 
@@ -40,7 +40,6 @@ if is_torch_available():
         GPTBigCodeLMHeadModel,
         GPTBigCodeModel,
     )
-
     from transformers.models.gpt_bigcode.configuration_gpt_bigcode import AttentionType
     from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeAttention
 

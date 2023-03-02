@@ -18,7 +18,7 @@
 import math
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
@@ -33,7 +33,7 @@ from transformers.modeling_outputs import (
     TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel, SequenceSummary
-from transformers.pytorch_utils import Conv1D, find_pruneable_heads_and_indices, prune_conv1d_layer
+from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.utils import (
     ModelOutput,
     add_code_sample_docstrings,
@@ -177,17 +177,17 @@ class GPTBigCodeAttention(nn.Module):
             if self.is_mqa:
                 raise NotImplementedError(f"attention_type {self.attention_type}  for cross_attention")
 
-            self.c_attn = Conv1D(2 * self.embed_dim, self.embed_dim)
-            self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+            self.c_attn = torch.nn.Linear(self.embed_dim, 2 * self.embed_dim)
+            self.q_attn = torch.nn.Linear(self.embed_dim, self.embed_dim)
         else:
             if self.attention_type == AttentionType.MULTI_QUERY_2:
-                self.q_attn = Conv1D(self.embed_dim, self.embed_dim)
+                self.q_attn = torch.nn.Linear(self.embed_dim, self.embed_dim)
                 # Keys and values are shared across heads
-                self.kv_attn = Conv1D(2 * self.head_dim, self.embed_dim)
+                self.kv_attn = torch.nn.Linear(self.embed_dim, 2 * self.head_dim)
             else:
-                self.c_attn = Conv1D(self.embed_dim + 2 * self.kv_dim, self.embed_dim)
+                self.c_attn = torch.nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_dim)
 
-        self.c_proj = Conv1D(self.embed_dim, self.embed_dim)
+        self.c_proj = torch.nn.Linear(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
@@ -195,40 +195,21 @@ class GPTBigCodeAttention(nn.Module):
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
+        if self.is_mqa:
+            raise NotImplementedError("prune_heads not implemented for MQA")
         if len(heads) == 0:
             return
         heads, index = find_pruneable_heads_and_indices(heads, self.num_heads, self.head_dim, self.pruned_heads)
         index_attn = torch.cat([index, index + self.split_size, index + (2 * self.split_size)])
 
-        # Prune conv1d layers
-        self.c_attn = prune_conv1d_layer(self.c_attn, index_attn, dim=1)
-        self.c_proj = prune_conv1d_layer(self.c_proj, index, dim=0)
+        # Prune linear layers
+        self.c_attn = prune_linear_layer(self.c_attn, index_attn, dim=1)
+        self.c_proj = prune_linear_layer(self.c_proj, index, dim=0)
 
         # Update hyper params
         self.split_size = (self.split_size // self.num_heads) * (self.num_heads - len(heads))
         self.num_heads = self.num_heads - len(heads)
         self.pruned_heads = self.pruned_heads.union(heads)
-
-    def _matmul(self, x, y, dtype=None, scale_factor=1.0):
-        output_shape = (*x.size()[:-1], y.size(-1))
-        if self.is_mqa:
-            # Q x K: (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
-            # A X V: (b, sq, nh, sk) x (b, sk, hs) -> (b, sq, nh, hs)
-            output_view = (x.size(0), x.size(1) * x.size(2), y.size(-1))
-            # No copy needed for MQA 2, or when layer_past is provided.
-            x = x.reshape(*output_view[:-1], x.size(-1))
-        else:
-            # Q x K: (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
-            # A X V: (b, nh, sq, sk) x (b, nh, sk, hs) -> (b, nh, sq, hs)
-            output_view = (x.size(0) * x.size(1), x.size(2), y.size(-1))
-            # Always copies
-            x = x.reshape(output_view[0], *x.size()[2:])
-            # No copy when layer_past is provided.
-            y = y.reshape(output_view[0], *y.size()[2:])
-        # This is identical to matmul when scale_factor==1
-        z = torch.empty(output_view, dtype=x.dtype if dtype is None else dtype, device=x.device)
-        z = torch.baddbmm(z, x, y, beta=0, alpha=scale_factor)
-        return z.view(output_shape)
 
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
@@ -246,7 +227,32 @@ class GPTBigCodeAttention(nn.Module):
         if self.scale_attn_weights:
             scale_factor /= self.head_dim**0.5
 
-        attn_weights = self._matmul(query, key.transpose(-1, -2), scale_factor=scale_factor)
+        # MQA: (b, sq, nh * hs)
+        # MHA: (b, nh, sq, hs)
+        query_shape = query.shape
+        batch_size = query_shape[0]
+        key_length = key.size(-1)
+        if self.is_mqa:
+            # (b, sq, nh, hs) x (b, hs, sk) -> (b, sq, nh, sk)
+            query_length = query_shape[1]
+            attn_shape = (batch_size, query_length, self.num_heads, key_length)
+            attn_view = (batch_size, query_length * self.num_heads, key_length)
+            # No copy needed for MQA 2, or when layer_past is provided.
+            query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+        else:
+            # (b, nh, sq, hs) x (b, nh, hs, sk) -> (b, nh, sq, sk)
+            query_length = query_shape[2]
+            attn_shape = (batch_size, self.num_heads, query_length, key_length)
+            attn_view = (batch_size * self.num_heads, query_length, key_length)
+            # Always copies
+            query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
+            # No copy when layer_past is provided.
+            key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
+        attn_weights = torch.baddbmm(
+            torch.empty(attn_view, dtype=query.dtype, device=query.device), query, key, beta=0, alpha=scale_factor
+        ).view(attn_shape)
+
+        # attn_weights = self._matmul(query, key, scale_factor=scale_factor)
 
         if upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
@@ -268,33 +274,17 @@ class GPTBigCodeAttention(nn.Module):
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
-        attn_output = self._matmul(attn_weights, value)
+        if self.is_mqa:
+            attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
+        else:
+            attn_output = torch.matmul(attn_weights, value)
 
         return attn_output, attn_weights
 
-    def _split_heads(self, tensor, num_heads, attn_head_size, permute=True):
-        """
-        Splits hidden_size dim into attn_head_size and num_heads
-        """
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-        tensor = tensor.view(new_shape)
-        if permute:
-            tensor = tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
-        return tensor
-
-    def _merge_heads(self, tensor, num_heads, attn_head_size, permute=True):
-        """
-        Merges attn_head_size dim and num_attn_heads dim into hidden_size
-        """
-        if permute:
-            tensor = tensor.permute(0, 2, 1, 3).contiguous()
-        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
-        return tensor.view(new_shape)
-
     def forward(
         self,
-        hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        hidden_states: torch.FloatTensor,
+        layer_past: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -310,37 +300,38 @@ class GPTBigCodeAttention(nn.Module):
                 )
 
             query = self.q_attn(hidden_states)
-            key, value = self.c_attn(encoder_hidden_states).split(self.split_size, dim=2)
+            key_value = self.c_attn(encoder_hidden_states)
             attention_mask = encoder_attention_mask
+        elif self.attention_type == AttentionType.MULTI_QUERY_2:
+            query = self.q_attn(hidden_states)
+            key_value = self.kv_attn(hidden_states)
+        elif self.attention_type == AttentionType.MULTI_QUERY_1:
+            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
         else:
-            if self.attention_type == AttentionType.MULTI_QUERY_2:
-                query = self.q_attn(hidden_states)
-                key, value = self.kv_attn(hidden_states).split((self.kv_dim, self.kv_dim), dim=2)
-            else:
-                query, key, value = self.c_attn(hidden_states).split((self.embed_dim, self.kv_dim, self.kv_dim), dim=2)
-
-        query = self._split_heads(query, self.num_heads, self.head_dim, permute=not self.is_mqa)
-        if not self.is_mqa:
-            key = self._split_heads(key, self.num_heads, self.head_dim)
-            value = self._split_heads(value, self.num_heads, self.head_dim)
+            # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
+            # i.e., the memory layout is not the same as GPT2.
+            # This makes the concatenation with past_key_value more efficient.
+            query, key_value = (
+                self.c_attn(hidden_states)
+                .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
+                .transpose(1, 2)
+                .split((self.head_dim, 2 * self.head_dim), dim=3)
+            )
 
         if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
+            key_value = torch.cat((layer_past, key_value), dim=-2)
 
-        if use_cache is True:
-            present = (key, value)
-        else:
-            present = None
+        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
-        attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim, permute=not self.is_mqa)
+        if not self.is_mqa:
+            attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        outputs = (attn_output, present)
+        # TODO: Is it ok to send unwrapped present?
+        outputs = (attn_output, key_value if use_cache else None)
         if output_attentions:
             outputs += (attn_weights,)
 
@@ -351,8 +342,8 @@ class GPTBigCodeMLP(nn.Module):
     def __init__(self, intermediate_size, config):
         super().__init__()
         embed_dim = config.hidden_size
-        self.c_fc = Conv1D(intermediate_size, embed_dim)
-        self.c_proj = Conv1D(embed_dim, intermediate_size)
+        self.c_fc = torch.nn.Linear(embed_dim, intermediate_size)
+        self.c_proj = torch.nn.Linear(intermediate_size, embed_dim)
         self.act = ACT2FN[config.activation_function]
         self.dropout = nn.Dropout(config.resid_pdrop)
 
@@ -385,14 +376,14 @@ class GPTBigCodeBlock(nn.Module):
     def forward(
         self,
         hidden_states: Optional[Tuple[torch.FloatTensor]],
-        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        layer_past: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-    ) -> Union[Tuple[torch.Tensor], Optional[Tuple[torch.Tensor, Tuple[torch.FloatTensor, ...]]]]:
+    ) -> Tuple:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
@@ -462,7 +453,7 @@ class GPTBigCodePreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module):
         """Initialize the weights."""
-        if isinstance(module, (nn.Linear, Conv1D)):
+        if isinstance(module, nn.Linear):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
@@ -757,7 +748,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        past_key_values: Optional[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -852,7 +843,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         output_shape = input_shape + (hidden_states.size(-1),)
 
-        presents = () if use_cache else None
+        presents = [] if use_cache else None
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
@@ -909,8 +900,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 )
 
             hidden_states = outputs[0]
-            if use_cache is True:
-                presents = presents + (outputs[1],)
+            if use_cache:
+                presents.append(outputs[1])
 
             if output_attentions:
                 all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
