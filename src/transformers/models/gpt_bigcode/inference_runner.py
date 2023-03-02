@@ -71,11 +71,10 @@ class GPTBigCodeInferenceRunner:
         kv_caches = []
         for block in self.model.h:
             block.attn.freeze_kv_cache()
-            assert block.attn.kv_cache_max_batch_size == self.batch_size
-            assert block.attn.kv_cache_max_sequence_length == self.max_sequence_length
-            kv_caches.append(
-                block.attn.get_kv_cache(self.batch_size, self.max_sequence_length, self.device, self.dtype)
-            )
+            kv_cache=block.attn.get_kv_cache(self.batch_size, self.max_sequence_length, self.device, self.dtype)
+            if attn.is_mqa:
+                kv_cache=kv_cache.unsqueeze(1)
+            kv_caches.append(kv_cache)
 
         kv_cache_size = sum(kv_cache.numel() for kv_cache in kv_caches)
 
