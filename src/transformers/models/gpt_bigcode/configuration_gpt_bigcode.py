@@ -39,6 +39,19 @@ class AttentionType(IntEnum):
     MULTI_QUERY_2 = 3
 
 
+class InferenceRunnerType(IntEnum):
+    NO_RUNNER = 0
+    # Use the inference runner without cuda graphs.
+    BASE_RUNNER = 1
+    # Use cuda graphs in the inference runner. Leave out the attention which has a variable shape.
+    # This significantly lowers the cpu time and prevent a cpu bottleneck for smaller batches and models.
+    PARTIAL_GRAPH = 2
+    # Turn the whole model into a cuda graph. One graph for each sequence length.
+    # Note: only useful for small batches and models, graphs take some time to generate, flaky.
+    # Crashes with jit on A100 but seems to work without jit (PYTORCH_JIT=0) and on V100.
+    FULL_GRAPH = 3
+
+
 class GPTBigCodeConfig(PretrainedConfig):
     """
     # TODO: Update doc
@@ -169,6 +182,10 @@ class GPTBigCodeConfig(PretrainedConfig):
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         attention_type=AttentionType.MULTI_HEAD,
+        inference_runner=InferenceRunnerType.NO_RUNNER,
+        validate_runner_input=True,
+        runner_max_sequence_length=None,
+        pad_key_length=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -197,6 +214,14 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id
 
         self.attention_type = AttentionType(attention_type)
+
+        self.inference_runner = InferenceRunnerType(inference_runner)
+        # Set to False to disable input validation of safe inputs, for a small speedup.
+        self.validate_runner_input = validate_runner_input
+        # Set if `n_positions` uses too much memory.
+        self.runner_max_sequence_length = runner_max_sequence_length
+        # Pad key length to a multiple of 8.
+        self.pad_key_length = pad_key_length
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
