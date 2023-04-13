@@ -237,7 +237,7 @@ class GPTBigCodeAttention(nn.Module):
         kv_cache = self.kv_cache[: 2 * batch_size * self.kv_cache_max_sequence_length * self.kv_dim].view(
             batch_size, self.kv_heads, self.kv_cache_max_sequence_length, 2 * self.head_dim
         )
-        return kv_cache[:, 0, :sequence_length, :] if self.is_mqa else kv_cache[:, :, :sequence_length, :]
+        return kv_cache[:, 0, :sequence_length, :] if self.multi_query else kv_cache[:, :, :sequence_length, :]
 
     def forward(
         self,
@@ -287,7 +287,7 @@ class GPTBigCodeAttention(nn.Module):
                 kv_cache = self.get_kv_cache(
                     batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
                 )
-                if self.is_mqa:
+                if self.multi_query:
                     kv_cache[:, last_key_length:key_length, :].copy_(key_value)
                 key_value = kv_cache
                 if use_cache:
