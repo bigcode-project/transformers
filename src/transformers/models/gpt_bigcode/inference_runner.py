@@ -285,9 +285,9 @@ class GPTBigCodeInferenceRunner:
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.FloatTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
         past_key_values: Union[List[torch.Tensor], int],
     ) -> BaseModelOutputWithPastAndCrossAttentions:
         batch_size, query_length = input_ids.shape
