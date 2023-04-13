@@ -177,12 +177,11 @@ def convert_megatron_checkpoint(input_state_dict):
 
         # For layernorm(s), simply store the layer norm.
         if op_name.endswith("layernorm"):
-
             ln_name = "ln_1" if op_name.startswith("input") else "ln_2"
             output_state_dict[layer_name + "." + ln_name + "." + weight_or_bias] = val
 
         # Concatenate QKV matrix.
-        elif merge_qkv and (op_name == "self_attention.key_value"):
+        elif op_name == "self_attention.key_value":
             # Query is before key_value in the dict.
             query = output_state_dict.pop(layer_name + ".attn.q_attn." + weight_or_bias)
             out_val = torch.cat([query, val], dim=0)

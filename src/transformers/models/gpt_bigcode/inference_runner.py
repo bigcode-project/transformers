@@ -1,4 +1,3 @@
-import math
 from typing import List, Union
 
 import torch
@@ -71,9 +70,9 @@ class GPTBigCodeInferenceRunner:
         kv_caches = []
         for block in self.model.h:
             block.attn.freeze_kv_cache()
-            kv_cache=block.attn.get_kv_cache(self.batch_size, self.max_sequence_length, self.device, self.dtype)
+            kv_cache = block.attn.get_kv_cache(self.batch_size, self.max_sequence_length, self.device, self.dtype)
             if attn.is_mqa:
-                kv_cache=kv_cache.unsqueeze(1)
+                kv_cache = kv_cache.unsqueeze(1)
             kv_caches.append(kv_cache)
 
         kv_cache_size = sum(kv_cache.numel() for kv_cache in kv_caches)
@@ -158,7 +157,7 @@ class GPTBigCodeInferenceRunner:
         self.mlp_c_proj = activation_pool[query_begin:query_end].view(self.batch_size, -1)
 
         if self.inference_runner_type != InferenceRunnerType.BASE_RUNNER:
-            print(f"Generating cuda graphs")
+            print("Generating cuda graphs")
             self.memory_pool = None
             if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
                 self.cuda_graphs = {}
@@ -228,7 +227,6 @@ class GPTBigCodeInferenceRunner:
         )
 
     def _forward_attn(self, block, key_length):
-
         layer_idx = block.attn.layer_idx
         self.current_key_values[key_length][layer_idx].copy_(self.kv_attn)
         attn_weights = self.padded_attn_weights[key_length]

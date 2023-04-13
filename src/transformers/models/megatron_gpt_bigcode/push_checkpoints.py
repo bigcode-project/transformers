@@ -4,13 +4,13 @@ import subprocess
 from pathlib import Path
 
 from huggingface_hub import Repository
+
 from transformers.models.megatron_gpt_bigcode.convert_megatron_gpt_bigcode_checkpoint import main as convert
 
 
 """
-Script to upload Megatron checkpoints to a HF repo on the Hub.
-The script clones/creates a repo on the Hub, checks out a branch `--branch_name`,
-and converts each `iter_` checkpoint and saves it as a commit on that branch.
+Script to upload Megatron checkpoints to a HF repo on the Hub. The script clones/creates a repo on the Hub, checks out
+a branch `--branch_name`, and converts each `iter_` checkpoint and saves it as a commit on that branch.
 """
 
 
