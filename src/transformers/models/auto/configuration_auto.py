@@ -457,7 +457,7 @@ MODEL_NAMES_MAPPING = OrderedDict(
         ("glpn", "GLPN"),
         ("gpt-sw3", "GPT-Sw3"),
         ("gpt2", "OpenAI GPT-2"),
-        ("gpt_bigcode", "GPT BigCode"),
+        ("gpt_bigcode", "GPTBigCode"),
         ("gpt_neo", "GPT Neo"),
         ("gpt_neox", "GPT NeoX"),
         ("gpt_neox_japanese", "GPT NeoX Japanese"),

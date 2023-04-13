@@ -1,5 +1,9 @@
 # coding=utf-8
+<<<<<<< HEAD
 # Copyright 2020 The HuggingFace Team. All rights reserved.
+=======
+# Copyright 2023 The HuggingFace Team. All rights reserved.
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,25 +16,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+<<<<<<< HEAD
 
 
 import datetime
+=======
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 import math
 import unittest
 
 from parameterized import parameterized
+<<<<<<< HEAD
+=======
+
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 from transformers import GPTBigCodeConfig, is_torch_available
 from transformers.testing_utils import require_torch, slow, torch_device
 
 from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor, random_attention_mask
+<<<<<<< HEAD
+=======
+from ...test_pipeline_mixin import PipelineTesterMixin
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 
 
 if is_torch_available():
     import torch
 
     from transformers import (
+<<<<<<< HEAD
         GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST,
         GPT2Tokenizer,
         GPTBigCodeConfig,
@@ -41,11 +57,22 @@ if is_torch_available():
         GPTBigCodeModel,
     )
     from transformers.models.gpt_bigcode.configuration_gpt_bigcode import AttentionType
+=======
+        GPT2TokenizerFast,
+        GPTBigCodeForCausalLM,
+        GPTBigCodeForSequenceClassification,
+        GPTBigCodeForTokenClassification,
+        GPTBigCodeModel,
+    )
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
     from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeAttention
 
 
 class GPTBigCodeModelTester:
+<<<<<<< HEAD
     # TODO: Update the tests to use valid pretrained models.
+=======
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
     def __init__(
         self,
         parent,
@@ -61,7 +88,11 @@ class GPTBigCodeModelTester:
         num_hidden_layers=5,
         num_attention_heads=4,
         intermediate_size=37,
+<<<<<<< HEAD
         hidden_act="gelu",
+=======
+        hidden_act="relu",
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         max_position_embeddings=512,
@@ -70,6 +101,10 @@ class GPTBigCodeModelTester:
         initializer_range=0.02,
         num_labels=3,
         num_choices=4,
+<<<<<<< HEAD
+=======
+        multi_query=True,
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
         scope=None,
     ):
         self.parent = parent
@@ -96,11 +131,20 @@ class GPTBigCodeModelTester:
         self.num_choices = num_choices
         self.scope = None
         self.bos_token_id = vocab_size - 1
+<<<<<<< HEAD
         self.eos_token_id = vocab_size - 1
         self.pad_token_id = vocab_size - 1
 
     def get_large_model_config(self):
         return GPTBigCodeConfig.from_pretrained("bigcode/santacoder-fast-inference")
+=======
+        self.eos_token_id = vocab_size - 2
+        self.pad_token_id = vocab_size - 3
+        self.multi_query = multi_query
+
+    def get_large_model_config(self):
+        return GPTBigCodeConfig.from_pretrained("bigcode/gpt_bigcode-santacoder")
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 
     def prepare_config_and_inputs(
         self, gradient_checkpointing=False, scale_attn_by_inverse_layer_idx=False, reorder_and_upcast_attn=False
@@ -169,6 +213,12 @@ class GPTBigCodeModelTester:
             gradient_checkpointing=gradient_checkpointing,
             scale_attn_by_inverse_layer_idx=scale_attn_by_inverse_layer_idx,
             reorder_and_upcast_attn=reorder_and_upcast_attn,
+<<<<<<< HEAD
+=======
+            attention_softmax_in_fp32=False,
+            scale_attention_softmax_in_fp32=False,
+            multi_query=self.multi_query,
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
         )
 
     def get_pipeline_config(self):
@@ -334,7 +384,11 @@ class GPTBigCodeModelTester:
         self.parent.assertTrue(torch.allclose(output_from_past_slice, output_from_no_past_slice, atol=1e-3))
 
     def create_and_check_lm_head_model(self, config, input_ids, input_mask, head_mask, token_type_ids, *args):
+<<<<<<< HEAD
         model = GPTBigCodeLMHeadModel(config)
+=======
+        model = GPTBigCodeForCausalLM(config)
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
         model.to(torch_device)
         model.eval()
 
@@ -345,7 +399,11 @@ class GPTBigCodeModelTester:
     def create_and_check_forward_and_backwards(
         self, config, input_ids, input_mask, head_mask, token_type_ids, *args, gradient_checkpointing=False
     ):
+<<<<<<< HEAD
         model = GPTBigCodeLMHeadModel(config)
+=======
+        model = GPTBigCodeForCausalLM(config)
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
         model.to(torch_device)
         if gradient_checkpointing:
             model.gradient_checkpointing_enable()
@@ -355,6 +413,7 @@ class GPTBigCodeModelTester:
         self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.vocab_size))
         result.loss.backward()
 
+<<<<<<< HEAD
     def create_and_check_double_lm_head_model(
         self, config, input_ids, input_mask, head_mask, token_type_ids, mc_token_ids, *args
     ):
@@ -381,6 +440,8 @@ class GPTBigCodeModelTester:
         )
         self.parent.assertEqual(result.mc_logits.shape, (self.batch_size, self.num_choices))
 
+=======
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
     def create_and_check_gpt_bigcode_for_sequence_classification(
         self, config, input_ids, input_mask, head_mask, token_type_ids, mc_token_ids, sequence_labels, *args
     ):
@@ -434,6 +495,7 @@ class GPTBigCodeModelTester:
 
 
 @require_torch
+<<<<<<< HEAD
 class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
     # TODO: Update the tests to use valid pretrained models.
 
@@ -442,12 +504,21 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
             GPTBigCodeModel,
             GPTBigCodeLMHeadModel,
             GPTBigCodeDoubleHeadsModel,
+=======
+class GPTBigCodeMQAModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
+    # TODO: Update the tests to use valid pretrained models.
+    all_model_classes = (
+        (
+            GPTBigCodeModel,
+            GPTBigCodeForCausalLM,
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
             GPTBigCodeForSequenceClassification,
             GPTBigCodeForTokenClassification,
         )
         if is_torch_available()
         else ()
     )
+<<<<<<< HEAD
     all_generative_model_classes = (GPTBigCodeLMHeadModel, GPTBigCodeDoubleHeadsModel) if is_torch_available() else ()
     all_parallelizable_model_classes = (
         (GPTBigCodeLMHeadModel, GPTBigCodeDoubleHeadsModel) if is_torch_available() else ()
@@ -455,11 +526,31 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
     fx_compatible = True
     test_missing_keys = False
     test_model_parallel = True
+=======
+    all_generative_model_classes = (GPTBigCodeForCausalLM,) if is_torch_available() else ()
+    fx_compatible = False
+    test_missing_keys = False
+    test_pruning = False
+    test_torchscript = False
+    multi_query = True
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": GPTBigCodeModel,
+            "text-classification": GPTBigCodeForSequenceClassification,
+            "text-generation": GPTBigCodeForCausalLM,
+            "token-classification": GPTBigCodeForTokenClassification,
+            "zero-shot": GPTBigCodeForSequenceClassification,
+        }
+        if is_torch_available()
+        else {}
+    )
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 
     # special case for DoubleHeads model
     def _prepare_for_class(self, inputs_dict, model_class, return_labels=False):
         inputs_dict = super()._prepare_for_class(inputs_dict, model_class, return_labels=return_labels)
 
+<<<<<<< HEAD
         if return_labels:
             if model_class.__name__ == "GPTBigCodeDoubleHeadsModel":
                 inputs_dict["labels"] = torch.zeros(
@@ -486,6 +577,42 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
     def test_config(self):
         self.config_tester.run_common_tests()
 
+=======
+        return inputs_dict
+
+    def setUp(self):
+        self.model_tester = GPTBigCodeModelTester(self, multi_query=self.multi_query)
+        self.config_tester = ConfigTester(self, config_class=GPTBigCodeConfig, n_embd=37)
+
+    def tearDown(self):
+        import gc
+
+        gc.collect()
+
+    def test_config(self):
+        self.config_tester.run_common_tests()
+
+    @unittest.skip("MQA models does not support retain_grad")
+    def test_retain_grad_hidden_states_attentions(self):
+        pass
+
+    @unittest.skip("Contrastive search not supported due to non-standard caching mechanism")
+    def test_contrastive_generate(self):
+        pass
+
+    @unittest.skip("Contrastive search not supported due to non-standard caching mechanism")
+    def test_contrastive_generate_dict_outputs_use_cache(self):
+        pass
+
+    @unittest.skip("CPU offload seems to be broken for some reason - tiny models keep hitting corner cases")
+    def test_cpu_offload(self):
+        pass
+
+    @unittest.skip("Disk offload seems to be broken for some reason - tiny models keep hitting corner cases")
+    def test_disk_offload(self):
+        pass
+
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
     def test_gpt_bigcode_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_gpt_bigcode_model(*config_and_inputs)
@@ -506,10 +633,13 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_lm_head_model(*config_and_inputs)
 
+<<<<<<< HEAD
     def test_gpt_bigcode_double_lm_head_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_double_lm_head_model(*config_and_inputs)
 
+=======
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
     def test_gpt_bigcode_sequence_classification_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_gpt_bigcode_for_sequence_classification(*config_and_inputs)
@@ -534,6 +664,7 @@ class GPTBigCodeModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Test
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_gpt_bigcode_weight_initialization(*config_and_inputs)
 
+<<<<<<< HEAD
     @slow
     def test_batch_generation(self):
         model = GPTBigCodeLMHeadModel.from_pretrained("bigcode/santacoder-fast-inference")
@@ -819,12 +950,63 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         config = GPTBigCodeConfig.from_pretrained(
             "bigcode/santacoder-fast-inference",
             attention_type=attention_type,
+=======
+
+@require_torch
+class GPTBigCodeMHAModelTest(GPTBigCodeMQAModelTest):
+    # `parameterized_class` breaks with mixins, so we use inheritance instead
+    multi_query = False
+
+
+@slow
+@require_torch
+class GPTBigCodeModelLanguageGenerationTest(unittest.TestCase):
+    def test_generate_simple(self):
+        model = GPTBigCodeForCausalLM.from_pretrained("bigcode/gpt_bigcode-santacoder").to(torch_device)
+        tokenizer = GPT2TokenizerFast.from_pretrained("bigcode/gpt_bigcode-santacoder")
+
+        input_ids = tokenizer("def print_hello_world():", return_tensors="pt").input_ids.to(torch_device)
+
+        output_sequence = model.generate(input_ids)
+        output_sentence = tokenizer.decode(output_sequence[0], skip_special_tokens=True)
+
+        expected_output = """def print_hello_world():\n    print("Hello World!")\n\n\ndef print_hello_"""
+        self.assertEqual(output_sentence, expected_output)
+
+    def test_generate_batched(self):
+        tokenizer = GPT2TokenizerFast.from_pretrained("bigcode/gpt_bigcode-santacoder")
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"
+
+        model = GPTBigCodeForCausalLM.from_pretrained("bigcode/gpt_bigcode-santacoder").to(torch_device)
+
+        inputs = tokenizer(["def print_hello_world():", "def say_hello():"], return_tensors="pt", padding=True).to(
+            torch_device
+        )
+        outputs = model.generate(**inputs)
+        outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        expected_output = [
+            'def print_hello_world():\n    print("Hello World!")\n\n\ndef print_hello_',
+            'def say_hello():\n    print("Hello, World!")\n\n\nsay_hello()',
+        ]
+        self.assertListEqual(outputs, expected_output)
+
+
+@require_torch
+class GPTBigCodeMQATest(unittest.TestCase):
+    def get_attention(self, multi_query):
+        config = GPTBigCodeConfig.from_pretrained(
+            "bigcode/gpt_bigcode-santacoder",
+            multi_query=multi_query,
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
             attn_pdrop=0,
             resid_pdrop=0,
         )
         return GPTBigCodeAttention(config)
 
     @parameterized.expand([(seed, is_train_mode) for seed in range(5) for is_train_mode in [True, False]])
+<<<<<<< HEAD
     def test_mqa_correctness(self, seed, is_train_mode=True):
         torch.manual_seed(seed)
         embed_dim = 2048
@@ -869,10 +1051,46 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         attention_mh.train(is_train_mode)
         attention_mq1.train(is_train_mode)
         attention_mq2.train(is_train_mode)
+=======
+    def test_mqa_reduces_to_mha(self, seed, is_train_mode=True):
+        torch.manual_seed(seed)
+
+        # CREATE MQA AND MHA ATTENTIONS
+        attention_mqa = self.get_attention(True)
+        attention_mha = self.get_attention(False)
+
+        # ENFORCE MATCHING WEIGHTS
+        num_heads = attention_mqa.num_heads
+        embed_dim = attention_mqa.embed_dim
+        head_dim = attention_mqa.head_dim
+
+        with torch.no_grad():
+            mqa_q_weight = attention_mqa.c_attn.weight[:embed_dim, :].view(num_heads, 1, head_dim, embed_dim)
+            mqa_kv_weight = attention_mqa.c_attn.weight[embed_dim:, :].view(1, 2, head_dim, embed_dim)
+            mha_c_weight = torch.cat(
+                [mqa_q_weight, mqa_kv_weight.expand(num_heads, 2, head_dim, embed_dim)], dim=1
+            ).view(3 * num_heads * head_dim, embed_dim)
+
+            mqa_q_bias = attention_mqa.c_attn.bias[:embed_dim].view(num_heads, 1, head_dim)
+            mqa_kv_bias = attention_mqa.c_attn.bias[embed_dim:].view(1, 2, head_dim)
+            mha_c_bias = torch.cat([mqa_q_bias, mqa_kv_bias.expand(num_heads, 2, head_dim)], dim=1).view(
+                3 * num_heads * head_dim
+            )
+
+            attention_mha.c_attn.weight.copy_(mha_c_weight)
+            attention_mha.c_attn.bias.copy_(mha_c_bias)
+            attention_mha.c_proj.weight.copy_(attention_mqa.c_proj.weight)
+            attention_mha.c_proj.bias.copy_(attention_mqa.c_proj.bias)
+
+        # PUT THE MODEL INTO THE CORRECT MODE
+        attention_mha.train(is_train_mode)
+        attention_mqa.train(is_train_mode)
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465
 
         # RUN AN INPUT THROUGH THE MODELS
         num_tokens = 5
         hidden_states = torch.randn(1, num_tokens, embed_dim)
+<<<<<<< HEAD
         attention_mh_result = attention_mh(hidden_states)[0]
         attention_mq1_result = attention_mq1(hidden_states)[0]
         attention_mq2_result = attention_mq2(hidden_states)[0]
@@ -882,3 +1100,10 @@ class GPTBigCodeAttentionTest(unittest.TestCase):
         self.assertTrue(torch.allclose(attention_mh_result, attention_mq1_result, atol=tolerance))
         self.assertTrue(torch.allclose(attention_mh_result, attention_mq2_result, atol=tolerance))
         self.assertTrue(torch.allclose(attention_mq1_result, attention_mq2_result, atol=tolerance))
+=======
+        attention_mha_result = attention_mha(hidden_states)[0]
+        attention_mqa_result = attention_mqa(hidden_states)[0]
+
+        # CHECK THAT ALL OUTPUTS ARE THE SAME
+        self.assertTrue(torch.allclose(attention_mha_result, attention_mqa_result, atol=1e-5))
+>>>>>>> e0921c6b53310a47b10f01633809b2b9f785a465

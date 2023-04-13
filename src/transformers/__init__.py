@@ -298,7 +298,7 @@ _import_structure = {
     "models.git": ["GIT_PRETRAINED_CONFIG_ARCHIVE_MAP", "GitConfig", "GitProcessor", "GitVisionConfig"],
     "models.glpn": ["GLPN_PRETRAINED_CONFIG_ARCHIVE_MAP", "GLPNConfig"],
     "models.gpt2": ["GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPT2Config", "GPT2Tokenizer"],
-    "models.gpt_bigcode": ["GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPTBigCodeConfig", "GPTBigCodeTokenizer"],
+    "models.gpt_bigcode": ["GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPTBigCodeConfig"],
     "models.gpt_neo": ["GPT_NEO_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPTNeoConfig"],
     "models.gpt_neox": ["GPT_NEOX_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPTNeoXConfig"],
     "models.gpt_neox_japanese": ["GPT_NEOX_JAPANESE_PRETRAINED_CONFIG_ARCHIVE_MAP", "GPTNeoXJapaneseConfig"],
@@ -1645,13 +1645,11 @@ else:
     _import_structure["models.gpt_bigcode"].extend(
         [
             "GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST",
-            "GPTBigCodeDoubleHeadsModel",
+            "GPTBigCodeForCausalLM",
             "GPTBigCodeForSequenceClassification",
             "GPTBigCodeForTokenClassification",
-            "GPTBigCodeLMHeadModel",
             "GPTBigCodeModel",
             "GPTBigCodePreTrainedModel",
-            "load_tf_weights_in_gpt_bigcode",
         ]
     )
     _import_structure["models.gpt_neo"].extend(
@@ -5149,13 +5147,11 @@ if TYPE_CHECKING:
         )
         from .models.gpt_bigcode import (
             GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST,
-            GPTBigCodeDoubleHeadsModel,
+            GPTBigCodeForCausalLM,
             GPTBigCodeForSequenceClassification,
             GPTBigCodeForTokenClassification,
-            GPTBigCodeLMHeadModel,
             GPTBigCodeModel,
             GPTBigCodePreTrainedModel,
-            load_tf_weights_in_gpt_bigcode,
         )
         from .models.gpt_neo import (
             GPT_NEO_PRETRAINED_MODEL_ARCHIVE_LIST,

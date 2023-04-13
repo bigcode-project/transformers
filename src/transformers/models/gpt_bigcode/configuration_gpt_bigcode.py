@@ -1,6 +1,5 @@
 # coding=utf-8
-# Copyright 2018 The OpenAI Team Authors and HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+# Copyright 2023 The BigCode team and HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,52 +12,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" OpenAI GPT-2 configuration"""
-from collections import OrderedDict
-from enum import IntEnum
-from typing import Any, List, Mapping, Optional
+""" GPTBigCode configuration"""
 
-from transformers import PreTrainedTokenizer, TensorType, is_torch_available
-from transformers.configuration_utils import PretrainedConfig
-from transformers.onnx import OnnxConfigWithPast, PatchingSpec
-from transformers.utils import logging
+from ...configuration_utils import PretrainedConfig
+from ...utils import logging
 
 
 logger = logging.get_logger(__name__)
 
 GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP = {
-    "bigcode/santacoder-fast-inference": (
-        "https://huggingface.co/bigcode/santacoder-fast-inference/resolve/main/config.json"
-    ),
+    "bigcode/gpt_bigcode-santacoder": "https://huggingface.co/bigcode/gpt_bigcode-santacoder/resolve/main/config.json",
 }
-
-
-class AttentionType(IntEnum):
-    MULTI_HEAD = 1
-    MULTI_QUERY_1 = 2
-    MULTI_QUERY_2 = 3
-
-
-class InferenceRunnerType(IntEnum):
-    NO_RUNNER = 0
-    # Use the inference runner without cuda graphs.
-    BASE_RUNNER = 1
-    # Use cuda graphs in the inference runner. Leave out the attention which has a variable shape.
-    # This significantly lowers the cpu time and prevent a cpu bottleneck for smaller batches and models.
-    PARTIAL_GRAPH = 2
-    # Turn the whole model into a cuda graph. One graph for each sequence length.
-    # Note: only useful for small batches and models, graphs take some time to generate, flaky.
-    # Crashes with jit on A100 but seems to work without jit (PYTORCH_JIT=0) and on V100.
-    FULL_GRAPH = 3
 
 
 class GPTBigCodeConfig(PretrainedConfig):
     """
-    # TODO: Update doc
-    This is the configuration class to store the configuration of a [`GPTBigCodeModel`] or a [`TFGPTBigCodeModel`]. It is used to
-    instantiate a GPT-2 model according to the specified arguments, defining the model architecture. Instantiating a
-    configuration with the defaults will yield a similar configuration to that of the GPT-2
-    [gpt2](https://huggingface.co/gpt2) architecture.
+    This is the configuration class to store the configuration of a [`GPTBigCodeModel`]. It is used to instantiate a
+    GPTBigCode model according to the specified arguments, defining the model architecture. Instantiating a
+    configuration with the defaults will yield a similar configuration to that of the GPTBigCode
+    [gpt_bigcode](https://huggingface.co/gpt_bigcode) architecture.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
@@ -67,7 +39,7 @@ class GPTBigCodeConfig(PretrainedConfig):
     Args:
         vocab_size (`int`, *optional*, defaults to 50257):
             Vocabulary size of the GPT-2 model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`GPTBigCodeModel`] or [`TFGPTBigCodeModel`].
+            `inputs_ids` passed when calling [`GPTBigCodeModel`].
         n_positions (`int`, *optional*, defaults to 1024):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 512 or 1024 or 2048).
@@ -79,11 +51,12 @@ class GPTBigCodeConfig(PretrainedConfig):
             Number of attention heads for each attention layer in the Transformer encoder.
         n_inner (`int`, *optional*, defaults to None):
             Dimensionality of the inner feed-forward layers. `None` will set it to 4 times n_embd
-        activation_function (`str`, *optional*, defaults to `"gelu"`):
-            Activation function, to be selected in the list `["relu", "silu", "gelu", "tanh", "gelu_new"]`.
+        activation_function (`str`, *optional*, defaults to `"gelu_pytorch_tanh"`):
+            Activation function, to be selected in the list `["relu", "silu", "gelu", "tanh", "gelu_new",
+            "gelu_pytorch_tanh"]`.
         resid_pdrop (`float`, *optional*, defaults to 0.1):
             The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
-        embd_pdrop (`int`, *optional*, defaults to 0.1):
+        embd_pdrop (`float`, *optional*, defaults to 0.1):
             The dropout ratio for the embeddings.
         attn_pdrop (`float`, *optional*, defaults to 0.1):
             The dropout ratio for the attention.
@@ -91,47 +64,16 @@ class GPTBigCodeConfig(PretrainedConfig):
             The epsilon to use in the layer normalization layers.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        summary_type (`string`, *optional*, defaults to `"cls_index"`):
-            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
-            [`TFGPTBigCodeDoubleHeadsModel`].
-
-            Has to be one of the following options:
-
-                - `"last"`: Take the last token hidden state (like XLNet).
-                - `"first"`: Take the first token hidden state (like BERT).
-                - `"mean"`: Take the mean of all tokens hidden states.
-                - `"cls_index"`: Supply a Tensor of classification token position (like GPT/GPT-2).
-                - `"attn"`: Not implemented now, use multi-head attention.
-        summary_use_proj (`bool`, *optional*, defaults to `True`):
-            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
-            [`TFGPTBigCodeDoubleHeadsModel`].
-
-            Whether or not to add a projection after the vector extraction.
-        summary_activation (`str`, *optional*):
-            Argument used when doing sequence summary. Used in for the multiple choice head in
-            [`GPTBigCodeDoubleHeadsModel`].
-
-            Pass `"tanh"` for a tanh activation to the output, any other value will result in no activation.
-        summary_proj_to_labels (`bool`, *optional*, defaults to `True`):
-            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
-            [`TFGPTBigCodeDoubleHeadsModel`].
-
-            Whether the projection outputs should have `config.num_labels` or `config.hidden_size` classes.
-        summary_first_dropout (`float`, *optional*, defaults to 0.1):
-            Argument used when doing sequence summary, used in the models [`GPTBigCodeDoubleHeadsModel`] and
-            [`TFGPTBigCodeDoubleHeadsModel`].
-
-            The dropout ratio to be used after the projection and activation.
         scale_attn_weights (`bool`, *optional*, defaults to `True`):
             Scale attention weights by dividing by sqrt(hidden_size)..
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models).
-        scale_attn_by_inverse_layer_idx (`bool`, *optional*, defaults to `False`):
-            Whether to additionally scale attention weights by `1 / layer_idx + 1`.
-        reorder_and_upcast_attn (`bool`, *optional*, defaults to `False`):
-            Whether to scale keys (K) prior to computing attention (dot-product) and upcast attention
-            dot-product/softmax to float() when training with mixed precision.
-
+        attention_softmax_in_fp32 (`bool`, *optional*, defaults to `True`):
+            Whether to call the fused softmax in float32.
+        scale_attention_softmax_in_fp32 (`bool`, *optional*, defaults to `True`):
+            Whether to scale the attention softmax in float32.
+        attention_type (`bool`, *optional*, defaults to `True`):
+            Whether to use Multi-Query Attion (`True`) or Multi-Head Attention (`False`).
     Example:
 
     ```python
@@ -170,24 +112,13 @@ class GPTBigCodeConfig(PretrainedConfig):
         attn_pdrop=0.1,
         layer_norm_epsilon=1e-5,
         initializer_range=0.02,
-        summary_type="cls_index",
-        summary_use_proj=True,
-        summary_activation=None,
-        summary_proj_to_labels=True,
-        summary_first_dropout=0.1,
         scale_attn_weights=True,
         use_cache=True,
         bos_token_id=50256,
         eos_token_id=50256,
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
-        attention_type=AttentionType.MULTI_HEAD,
-        inference_runner=InferenceRunnerType.NO_RUNNER,
-        validate_runner_input=True,
-        pre_allocate_kv_cache=False,
-        max_sequence_length=None,
-        max_batch_size=None,
-        pad_key_length=True,
+        multi_query=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -202,113 +133,13 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.attn_pdrop = attn_pdrop
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_range = initializer_range
-        self.summary_type = summary_type
-        self.summary_use_proj = summary_use_proj
-        self.summary_activation = summary_activation
-        self.summary_first_dropout = summary_first_dropout
-        self.summary_proj_to_labels = summary_proj_to_labels
         self.scale_attn_weights = scale_attn_weights
         self.use_cache = use_cache
         self.attention_softmax_in_fp32 = attention_softmax_in_fp32
         self.scale_attention_softmax_in_fp32 = scale_attention_softmax_in_fp32
+        self.multi_query = multi_query
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
 
-        self.attention_type = AttentionType(attention_type)
-
-        self.inference_runner = InferenceRunnerType(inference_runner)
-        # Set to False to disable input validation of safe inputs, for a small speedup.
-        self.validate_runner_input = validate_runner_input
-
-        self.pre_allocate_kv_cache = pre_allocate_kv_cache
-        # The max sequence length for the pre-allocated KV cache (`n_positions` if not provided).
-        self.max_sequence_length = max_sequence_length
-        # The max batch size for the pre-allocated KV cache, (deduce from input if not provided).
-        self.max_batch_size = max_batch_size
-        # Pad key length to a multiple of 8 (requires pre_allocate_kv_cache).
-        self.pad_key_length = pad_key_length
-
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
-
-
-class GPTBigCodeOnnxConfig(OnnxConfigWithPast):
-    # TODO: Onnx support?
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        task: str = "default",
-        patching_specs: List[PatchingSpec] = None,
-        use_past: bool = False,
-    ):
-        super().__init__(config, task=task, patching_specs=patching_specs, use_past=use_past)
-        if not getattr(self._config, "pad_token_id", None):
-            # TODO: how to do that better?
-            self._config.pad_token_id = 0
-
-    @property
-    def inputs(self) -> Mapping[str, Mapping[int, str]]:
-        common_inputs = OrderedDict({"input_ids": {0: "batch", 1: "sequence"}})
-        if self.use_past:
-            self.fill_with_past_key_values_(common_inputs, direction="inputs")
-            common_inputs["attention_mask"] = {0: "batch", 1: "past_sequence + sequence"}
-        else:
-            common_inputs["attention_mask"] = {0: "batch", 1: "sequence"}
-
-        return common_inputs
-
-    @property
-    def num_layers(self) -> int:
-        return self._config.n_layer
-
-    @property
-    def num_attention_heads(self) -> int:
-        return self._config.n_head
-
-    def generate_dummy_inputs(
-        self,
-        tokenizer: PreTrainedTokenizer,
-        batch_size: int = -1,
-        seq_length: int = -1,
-        is_pair: bool = False,
-        framework: Optional[TensorType] = None,
-    ) -> Mapping[str, Any]:
-        common_inputs = super(OnnxConfigWithPast, self).generate_dummy_inputs(
-            tokenizer, batch_size=batch_size, seq_length=seq_length, is_pair=is_pair, framework=framework
-        )
-
-        # We need to order the input in the way they appears in the forward()
-        ordered_inputs = OrderedDict({"input_ids": common_inputs["input_ids"]})
-
-        # Need to add the past_keys
-        if self.use_past:
-            if not is_torch_available():
-                raise ValueError("Cannot generate dummy past_keys inputs without PyTorch installed.")
-            else:
-                import torch
-
-                batch, seqlen = common_inputs["input_ids"].shape
-                # Not using the same length for past_key_values
-                past_key_values_length = seqlen + 2
-                past_shape = (
-                    batch,
-                    self.num_attention_heads,
-                    past_key_values_length,
-                    self._config.hidden_size // self.num_attention_heads,
-                )
-                ordered_inputs["past_key_values"] = [
-                    (torch.zeros(past_shape), torch.zeros(past_shape)) for _ in range(self.num_layers)
-                ]
-
-        ordered_inputs["attention_mask"] = common_inputs["attention_mask"]
-        if self.use_past:
-            mask_dtype = ordered_inputs["attention_mask"].dtype
-            ordered_inputs["attention_mask"] = torch.cat(
-                [ordered_inputs["attention_mask"], torch.ones(batch, past_key_values_length, dtype=mask_dtype)], dim=1
-            )
-
-        return ordered_inputs
-
-    @property
-    def default_onnx_opset(self) -> int:
-        return 13
