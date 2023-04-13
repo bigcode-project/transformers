@@ -430,11 +430,11 @@ class XGLMDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape `(seq_len, batch, embed_dim)`
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             encoder_hidden_states (`torch.FloatTensor`):
-                cross attention input to the layer of shape `(seq_len, batch, embed_dim)`
+                cross attention input to the layer of shape `(batch, seq_len, embed_dim)`
             encoder_attention_mask (`torch.FloatTensor`): encoder attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
@@ -510,6 +510,7 @@ class XGLMPreTrainedModel(PreTrainedModel):
     config_class = XGLMConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _no_split_modules = ["XGLMDecoderLayer"]
 
     def _init_weights(self, module):
         std = self.config.init_std
@@ -714,6 +715,14 @@ class XGLMModel(XGLMPreTrainedModel):
 
         hidden_states = nn.functional.dropout(hidden_states, p=float(self.dropout), training=self.training)
 
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache = True` is incompatible with gradient checkpointing`. Setting `use_cache ="
+                    " False`..."
+                )
+                use_cache = False
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -740,13 +749,6 @@ class XGLMModel(XGLMPreTrainedModel):
 
             if self.gradient_checkpointing and self.training:
 
-                if use_cache:
-                    logger.warning(
-                        "`use_cache = True` is incompatible with gradient checkpointing`. Setting `use_cache ="
-                        " False`..."
-                    )
-                    use_cache = False
-
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
@@ -765,7 +767,6 @@ class XGLMModel(XGLMPreTrainedModel):
                     None,
                 )
             else:
-
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -944,8 +945,8 @@ class XGLMForCausalLM(XGLMPreTrainedModel):
         }
 
     @staticmethod
-    def _reorder_cache(past, beam_idx):
+    def _reorder_cache(past_key_values, beam_idx):
         reordered_past = ()
-        for layer_past in past:
+        for layer_past in past_key_values:
             reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
         return reordered_past
