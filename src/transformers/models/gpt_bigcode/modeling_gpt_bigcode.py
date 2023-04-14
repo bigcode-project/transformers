@@ -225,8 +225,14 @@ class GPTBigCodeAttention(nn.Module):
             or sequence_length > self.kv_cache_max_sequence_length
         ):
             if self._frozen_kv_cache or not allocate:
-                # TODO: Improve error message
-                raise RuntimeError("KV cache not found." if self.kv_cache is None else "Invalid KV cache.")
+                if self.kv_cache is None:
+                    raise RuntimeError("KV cache not found.")
+                else:
+                    raise RuntimeError(
+                        f"Invalid KV cache: "
+                        f"existing = {(self.kv_cache.dtype,self.kv_cache.device,self.kv_cache_max_batch_size,self.kv_cache_max_sequence_length)}, "
+                        f"requested = {(dtype,device,batch_size,sequence_length)}"
+                    )
             # Free memory first.
             self.kv_cache = None
             self.kv_cache_max_sequence_length = max(sequence_length, self.kv_cache_max_sequence_length)
