@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch GPTBigCode model."""
+import contextlib
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -34,7 +35,18 @@ from ...utils import (
     add_start_docstrings_to_model_forward,
     logging,
 )
-from .configuration_gpt_bigcode import GPTBigCodeConfig, InferenceRunnerType
+from .configuration_gpt_bigcode import (
+    TORCH_IMPLEMENTATIONS,
+    AttentionImplementation,
+    GPTBigCodeConfig,
+    InferenceRunnerType,
+)
+
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+except ImportError:
+    flash_attn_unpadded_func = None
 
 
 logger = logging.get_logger(__name__)
@@ -84,6 +96,8 @@ class GPTBigCodeAttention(nn.Module):
         self.mask_value = None
 
         self.multi_query = config.multi_query
+        # TODO: chack availability
+        self.attention_implementation = config.attention_implementation
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
@@ -127,11 +141,493 @@ class GPTBigCodeAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
+        if self.attention_implementation == AttentionImplementation.BASE:
+            self._attn_fn = self._attn_mqa if self.multi_query else self._attn_mha
+        elif self.attention_implementation in TORCH_IMPLEMENTATIONS:
+            # TODO: Implement
+            assert not self.pre_allocate_kv_cache
+            self._attn_fn = self._attn_torch_mqa if self.multi_query else self._attn_torch_mha
+            self.backend_context = (
+                lambda: contextlib.nullcontext()
+                if self.attention_implementation == AttentionImplementation.TORCH
+                else torch.backends.cuda.sdp_kernel(
+                    enable_flash=self.attention_implementation == AttentionImplementation.TORCH_FLASH,
+                    enable_math=self.attention_implementation == AttentionImplementation.TORCH_CPP,
+                    enable_mem_efficient=self.attention_implementation == AttentionImplementation.TORCH_MEM,
+                )
+            )
+        elif self.attention_implementation == AttentionImplementation.FLASH:
+            # TODO: Implement
+            assert not self.pre_allocate_kv_cache
+            self._attn_fn = self._attn_flash_mqa if self.multi_query else self._attn_flash_mha
+        elif self.attention_implementation == AttentionImplementation.OLD:
+            self._attn_fn = None
+        else:
+            raise ValueError()
+
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
         if self.mask_value is None or self.mask_value.dtype != dtype or self.mask_value.device != device:
             self.mask_value = torch.full([], torch.finfo(dtype).min, dtype=dtype, device=device)
         return self.mask_value
+
+    def _get_attn_weights(self, query, key, attn_view, attn_shape, attention_mask=None, head_mask=None):
+        dtype = query.dtype
+        softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
+        upcast = dtype != softmax_dtype
+
+        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
+        scale_factor = unscale**-1
+        if self.scale_attn_weights:
+            scale_factor /= self.head_dim**0.5
+
+        attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
+        if query.device.type == "cpu":
+            # This is needed because of a bug in pytorch https://github.com/pytorch/pytorch/issues/80588.
+            # The bug was fixed in https://github.com/pytorch/pytorch/pull/96086,
+            # but the fix has not been released as of pytorch version 2.0.0.
+            attn_weights.zero_()
+            beta = 1
+        else:
+            beta = 0
+        attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
+
+        if upcast:
+            # Use a fused kernel to prevent a large overhead from casting and scaling.
+            # Sub-optimal when the key length is not a multiple of 8.
+            if attention_mask is None:
+                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
+            else:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
+        else:
+            if attention_mask is not None:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+
+                # The fused kernel is very slow when the key length is not a multiple of 8, so we skip fusion.
+                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
+
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
+
+        return attn_weights
+
+    def _attn_mha(self, hidden_states, layer_past, use_cache, attention_mask=None, head_mask=None):
+        # Q: (batch_size, num_heads, query_length, head_dim)
+        # K, V: (batch_size, num_heads, query_length, head_dim)
+        # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
+        # i.e., the memory layout is not the same as GPT2.
+        # This makes the concatenation with past_key_value more efficient.
+        query, key_value = (
+            self.c_attn(hidden_states)
+            .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
+            .transpose(1, 2)
+            .split((self.head_dim, 2 * self.head_dim), dim=3)
+        )
+        key, value, present = self._merge_kv_caches(key_value, layer_past, use_cache)
+
+        batch_size = query.size(0)
+        query_length = query.size(1)
+        key_length = key.size(1)
+
+        # MHA models: (batch_size, num_heads, query_length, head_dim)
+        # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
+        # -> (batch_size, num_heads, query_length, key_length)
+        attn_shape = (batch_size, self.num_heads, query_length, key_length)
+        attn_view = (batch_size * self.num_heads, query_length, key_length)
+        # Always copies
+        query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
+        # No copy when layer_past is provided.
+        key = key.transpose(-1, -2).reshape(batch_size * self.num_heads, self.head_dim, key_length)
+
+        # attn_weights: (batch_size, num_heads, query_length, key_length)
+        attn_weights = self._get_attn_weights(query, key, attn_view, attn_shape, attention_mask, head_mask)
+
+        # attn_output: (batch_size, num_heads, query_length, head_dim)
+        attn_output = torch.matmul(attn_weights, value)
+
+        # attn_output: (batch_size, query_length, num_heads * head_dim)
+        attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
+
+        return attn_output, present, attn_weights
+
+    def _attn_mqa(self, hidden_states, layer_past, use_cache, attention_mask=None, head_mask=None):
+        # Q: (batch_size, query_length, num_heads * head_dim)
+        # K, V:(batch_size, key_length, head_dim)
+        query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+        key, value, present = self._merge_kv_caches(key_value, layer_past, use_cache)
+
+        batch_size = query.size(0)
+        query_length = query.size(1)
+        key_length = key.size(1)
+
+        # (batch_size, query_length, num_heads, head_dim) x (batch_size, head_dim, key_length)
+        # -> (batch_size, query_length, num_heads, key_length)
+        attn_shape = (batch_size, query_length, self.num_heads, key_length)
+        attn_view = (batch_size, query_length * self.num_heads, key_length)
+        # No copy needed for MQA 2, or when layer_past is provided.
+        query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+        key = key.transpose(-1, -2)
+
+        if head_mask is not None:
+            head_mask = head_mask.transpose(1, 2)
+
+        # attn_weights: (batch_size, query_length, num_heads, key_length)
+        attn_weights = self._get_attn_weights(query, key, attn_view, attn_shape, attention_mask, head_mask)
+
+        # attn_output: (batch_size, query_length, num_heads * head_dim)
+        attn_output = torch.bmm(attn_weights.view(attn_view), value).view(hidden_states.shape)
+
+        return attn_output, present, attn_weights
+
+    def _attn_torch_mha(self, hidden_states, layer_past, use_cache, attention_mask=None, head_mask=None):
+        # TODO: Scale?
+        # TODO: Use attn mask
+        if head_mask is not None:
+            raise NotImplementedError()
+        # Q: (batch_size, num_heads, query_length, head_dim)
+        # K, V: (batch_size, num_heads, query_length, head_dim)
+        query, key_value = (
+            self.c_attn(hidden_states)
+            .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
+            .transpose(1, 2)
+            .split((self.head_dim, 2 * self.head_dim), dim=3)
+        )
+
+        key, value, present = self._merge_kv_caches(key_value, layer_past, use_cache)
+
+        with self.backend_context():
+            # attn_output: (batch_size, num_heads, query_length, head_dim)
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, None, self.attn_dropout, is_causal=True  # attention_mask,
+            )
+
+        # attn_output: (batch_size, query_length, num_heads * head_dim)
+        attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
+
+        return attn_output, present, None
+
+    def _attn_torch_mqa(self, hidden_states, layer_past, use_cache, attention_mask=None, head_mask=None):
+        # TODO: Scale?
+        # TODO: Use attn mask
+        if head_mask is not None:
+            raise NotImplementedError()
+        # Q: (batch_size, query_length, num_heads * head_dim)
+        # K, V:(batch_size, key_length, head_dim)
+        query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+        key, value, present = self._merge_kv_caches(key_value, layer_past, use_cache)
+
+        batch_size = query.size(0)
+        query_length = query.size(1)
+
+        if query_length == 1:
+            # attn_output: (batch_size, 1, num_heads, head_dim)
+            is_causal = False
+            query = query.view(batch_size, 1, self.num_heads, self.head_dim)
+            key = key.unsqueeze(1)
+            value = value.unsqueeze(1)
+        else:
+            # attn_output: (batch_size, num_heads, query_length, head_dim)
+            is_causal = True
+            expanded_shape = (batch_size, self.num_heads, key.size(-2), self.head_dim)
+            query = query.view(batch_size, query_length, self.num_heads, self.head_dim).transpose(1, 2)
+            key = key.unsqueeze(1).expand(expanded_shape)
+            value = value.unsqueeze(1).expand(expanded_shape)
+        with self.backend_context():
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                None,  # attention_mask,
+                self.dropout_p if self.training else 0.0,
+                is_causal=is_causal,
+            )
+
+        if query_length != 1:
+            attn_output = attn_output.transpose(1, 2)
+
+        # attn_output: (batch_size, query_length, num_heads * head_dim)
+        # CPP backend needs reshape, others are ok with a view.
+        attn_output = attn_output.reshape(hidden_states.shape)
+
+        return attn_output, present, None
+
+    def _attn_flash_mha(self, hidden_states, layer_past, use_cache, attention_mask=None, head_mask=None):
+        # TODO: Use attn mask
+        if head_mask is not None:
+            raise NotImplementedError()
+        # Q: (batch_size, query_length, num_heads * head_dim)
+        # K, V:(batch_size, key_length, num_heads * head_dim)
+        query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+        key, value, present = self._merge_kv_caches(key_value, layer_past, use_cache)
+
+        batch_size = query.size(0)
+        query_length = query.size(1)
+        key_length = key.size(1)
+
+        # TODO: Pre-allocate?
+        cu_sq = torch.arange(
+            0, (batch_size + 1) * query_length, step=query_length, dtype=torch.int32, device=query.device
+        )
+        cu_sk = torch.arange(0, (batch_size + 1) * key_length, step=key_length, dtype=torch.int32, device=query.device)
+
+        # attn_output: (batch_size * query_length, num_heads, head_dim)
+        attn_output = flash_attn_unpadded_func(
+            query.view(batch_size * query_length, self.num_heads, self.head_dim),
+            key.view(batch_size * key_length, self.num_heads, self.head_dim),
+            value.view(batch_size * key_length, self.num_heads, self.head_dim),
+            cu_sq,
+            cu_sk,
+            query_length,
+            key_length,
+            self.dropout_p if self.training else 0.0,
+            softmax_scale=self.head_dim**-0.5 if self.scale_attn_weights else 1,
+            causal=True,
+        )
+
+        # attn_output: (batch_size, query_length, num_heads * head_dim)
+        # CPP backend needs reshape, others are ok with a view. (Checked for mqa, confirm for mha)
+        attn_output = attn_output.reshape(hidden_states.shape)
+
+        return attn_output, present, None
+
+    def _attn_flash_mqa(self, hidden_states, layer_past, use_cache, attention_mask=None, head_mask=None):
+        # TODO: Use attn mask
+        if head_mask is not None:
+            raise NotImplementedError()
+        # Q: (batch_size, query_length, num_heads * head_dim)
+        # K, V:(batch_size, key_length, head_dim)
+        query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+        key, value, present = self._merge_kv_caches(key_value, layer_past, use_cache)
+
+        batch_size = query.size(0)
+        query_length = query.size(1)
+        key_length = key.size(1)
+
+        key = key.reshape(batch_size * key_length, 1, self.head_dim)
+        value = value.reshape(batch_size * key_length, 1, self.head_dim)
+
+        if query_length == 1:
+            # attn_output: (batch_size * num_heads, 1, head_dim)
+            query_step = self.num_heads
+            causal = False
+            query = query.reshape(batch_size * query_step, 1, self.head_dim)
+        else:
+            # attn_output: (batch_size * query_length, num_heads, head_dim)
+            query_step = query_length
+            causal = True
+            query = query.view(batch_size * query_step, self.num_heads, self.head_dim)
+            key = key.expand(batch_size * key_length, self.num_heads, self.head_dim)
+            value = value.expand(batch_size * key_length, self.num_heads, self.head_dim)
+
+        # TODO: Pre-allocate?
+        cu_sq = torch.arange(0, (batch_size + 1) * query_step, step=query_step, dtype=torch.int32, device=query.device)
+        cu_sk = torch.arange(0, (batch_size + 1) * key_length, step=key_length, dtype=torch.int32, device=query.device)
+
+        attn_output = flash_attn_unpadded_func(
+            query,
+            key,
+            value,
+            cu_sq,
+            cu_sk,
+            query_step,
+            key_length,
+            self.dropout_p if self.training else 0.0,
+            softmax_scale=self.head_dim**-0.5 if self.scale_attn_weights else 1,
+            causal=causal,
+        )
+
+        # attn_output: (batch_size, query_length, num_heads * head_dim)
+        attn_output = attn_output.view(hidden_states.shape)
+
+        return attn_output, present, None
+
+    def freeze_kv_cache(self, enable=True):
+        if self.kv_cache is None:
+            raise RuntimeError("KV cache not found.")
+        # Prevent re-allocation of the KV cache.
+        self._frozen_kv_cache = enable
+
+    def get_kv_cache(self, batch_size, sequence_length, device, dtype, allocate=True):
+        if (
+            self.kv_cache is None
+            or self.kv_cache.dtype != dtype
+            or self.kv_cache.device != device
+            or batch_size > self.kv_cache_max_batch_size
+            or sequence_length > self.kv_cache_max_sequence_length
+        ):
+            if self._frozen_kv_cache or not allocate:
+                if self.kv_cache is None:
+                    raise RuntimeError("KV cache not found.")
+                else:
+                    raise RuntimeError(
+                        f"Invalid KV cache: "
+                        f"existing = {(self.kv_cache.dtype,self.kv_cache.device,self.kv_cache_max_batch_size,self.kv_cache_max_sequence_length)}, "
+                        f"requested = {(dtype,device,batch_size,sequence_length)}"
+                    )
+            # Free memory first.
+            self.kv_cache = None
+            self.kv_cache_max_sequence_length = max(sequence_length, self.kv_cache_max_sequence_length)
+            self.kv_cache_max_batch_size = max(batch_size, self.kv_cache_max_batch_size)
+            kv_cache_size = 2 * self.kv_cache_max_batch_size * self.kv_cache_max_sequence_length * self.kv_dim
+            self.kv_cache = torch.empty([kv_cache_size], device=device, dtype=dtype)
+        # This view ensures the cache is contiguous for all batch sizes.
+        kv_cache = self.kv_cache[: 2 * batch_size * self.kv_cache_max_sequence_length * self.kv_dim].view(
+            batch_size, self.kv_heads, self.kv_cache_max_sequence_length, 2 * self.head_dim
+        )
+        return kv_cache[:, 0, :sequence_length, :] if self.multi_query else kv_cache[:, :, :sequence_length, :]
+
+    def _merge_kv_caches(self, key_value, layer_past, use_cache):
+        present = None
+        if self.pre_allocate_kv_cache:
+            if use_cache or layer_past is not None:
+                last_key_length = layer_past or 0
+                batch_size = key_value.size(0)
+                key_length = last_key_length + key_value.size(-2)
+                padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
+                kv_cache = self.get_kv_cache(
+                    batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
+                )
+                if self.multi_query:
+                    kv_cache[:, last_key_length:key_length, :].copy_(key_value)
+                key_value = kv_cache
+                if use_cache:
+                    present = key_length
+        else:
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            if use_cache:
+                present = key_value
+        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
+        return key, value, present
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        layer_past: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
+    ]:
+        if self.attention_implementation == AttentionImplementation.OLD:
+            return self._old_forward(
+                hidden_states,
+                layer_past,
+                attention_mask,
+                head_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                use_cache,
+                output_attentions,
+            )
+        if encoder_hidden_states is not None:
+            raise NotImplementedError()
+
+        attn_output, present, attn_weights = self._attn_fn(
+            hidden_states, layer_past, use_cache, attention_mask, head_mask
+        )
+
+        attn_output = self.c_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+
+        outputs = (attn_output, present)
+        if output_attentions:
+            if attn_weights is None:
+                raise NotImplementedError("`output_attentions` not supported.")
+            if self.multi_query:
+                # Transpose to return weights in the usual format (batch_size, num_heads, query_length, key_length)
+                attn_weights = attn_weights.transpose(1, 2)
+            outputs += (attn_weights,)
+
+        return outputs  # a, present, (attentions)
+
+    def _old_forward(
+        self,
+        hidden_states: torch.Tensor,
+        layer_past: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
+    ]:
+        if encoder_hidden_states is not None:
+            if not hasattr(self, "q_attn") or not self.is_cross_attention:
+                raise ValueError(
+                    "If class is used as cross attention, the weights `q_attn` have to be defined. "
+                    "Please make sure to instantiate class with `GPTBigCodeAttention(..., is_cross_attention=True)`."
+                )
+
+            query = self.q_attn(hidden_states)
+            key_value = self.c_attn(encoder_hidden_states)
+            attention_mask = encoder_attention_mask
+        elif self.multi_query:
+            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+        else:
+            # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
+            # i.e., the memory layout is not the same as GPT2.
+            # This makes the concatenation with past_key_value more efficient.
+            query, key_value = (
+                self.c_attn(hidden_states)
+                .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
+                .transpose(1, 2)
+                .split((self.head_dim, 2 * self.head_dim), dim=3)
+            )
+
+        present = None
+
+        if self.pre_allocate_kv_cache:
+            if use_cache or layer_past is not None:
+                last_key_length = layer_past or 0
+                batch_size = key_value.size(0)
+                key_length = last_key_length + key_value.size(-2)
+                padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
+                kv_cache = self.get_kv_cache(
+                    batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
+                )
+                if self.multi_query:
+                    kv_cache[:, last_key_length:key_length, :].copy_(key_value)
+                key_value = kv_cache
+                if use_cache:
+                    present = key_length
+        else:
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            if use_cache:
+                present = key_value
+
+        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
+
+        attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
+
+        if not self.multi_query:
+            attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
+        attn_output = self.c_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+
+        outputs = (attn_output, present)
+        if output_attentions:
+            if self.multi_query:
+                # Transpose to return weights in the usual format (batch_size, num_heads, query_length, key_length)
+                attn_weights = attn_weights.transpose(1, 2)
+            outputs += (attn_weights,)
+
+        return outputs  # a, present, (attentions)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         dtype = query.dtype
@@ -209,118 +705,6 @@ class GPTBigCodeAttention(nn.Module):
             attn_output = torch.matmul(attn_weights, value)
 
         return attn_output, attn_weights
-
-    def freeze_kv_cache(self, enable=True):
-        if self.kv_cache is None:
-            raise RuntimeError("KV cache not found.")
-        # Prevent re-allocation of the KV cache.
-        self._frozen_kv_cache = enable
-
-    def get_kv_cache(self, batch_size, sequence_length, device, dtype, allocate=True):
-        if (
-            self.kv_cache is None
-            or self.kv_cache.dtype != dtype
-            or self.kv_cache.device != device
-            or batch_size > self.kv_cache_max_batch_size
-            or sequence_length > self.kv_cache_max_sequence_length
-        ):
-            if self._frozen_kv_cache or not allocate:
-                if self.kv_cache is None:
-                    raise RuntimeError("KV cache not found.")
-                else:
-                    raise RuntimeError(
-                        f"Invalid KV cache: "
-                        f"existing = {(self.kv_cache.dtype,self.kv_cache.device,self.kv_cache_max_batch_size,self.kv_cache_max_sequence_length)}, "
-                        f"requested = {(dtype,device,batch_size,sequence_length)}"
-                    )
-            # Free memory first.
-            self.kv_cache = None
-            self.kv_cache_max_sequence_length = max(sequence_length, self.kv_cache_max_sequence_length)
-            self.kv_cache_max_batch_size = max(batch_size, self.kv_cache_max_batch_size)
-            kv_cache_size = 2 * self.kv_cache_max_batch_size * self.kv_cache_max_sequence_length * self.kv_dim
-            self.kv_cache = torch.empty([kv_cache_size], device=device, dtype=dtype)
-        # This view ensures the cache is contiguous for all batch sizes.
-        kv_cache = self.kv_cache[: 2 * batch_size * self.kv_cache_max_sequence_length * self.kv_dim].view(
-            batch_size, self.kv_heads, self.kv_cache_max_sequence_length, 2 * self.head_dim
-        )
-        return kv_cache[:, 0, :sequence_length, :] if self.multi_query else kv_cache[:, :, :sequence_length, :]
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        layer_past: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-    ) -> Union[
-        Tuple[torch.Tensor, Optional[torch.Tensor]],
-        Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
-    ]:
-        if encoder_hidden_states is not None:
-            if not hasattr(self, "q_attn") or not self.is_cross_attention:
-                raise ValueError(
-                    "If class is used as cross attention, the weights `q_attn` have to be defined. "
-                    "Please make sure to instantiate class with `GPTBigCodeAttention(..., is_cross_attention=True)`."
-                )
-
-            query = self.q_attn(hidden_states)
-            key_value = self.c_attn(encoder_hidden_states)
-            attention_mask = encoder_attention_mask
-        elif self.multi_query:
-            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
-        else:
-            # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
-            # i.e., the memory layout is not the same as GPT2.
-            # This makes the concatenation with past_key_value more efficient.
-            query, key_value = (
-                self.c_attn(hidden_states)
-                .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
-                .transpose(1, 2)
-                .split((self.head_dim, 2 * self.head_dim), dim=3)
-            )
-
-        present = None
-
-        if self.pre_allocate_kv_cache:
-            if use_cache or layer_past is not None:
-                last_key_length = layer_past or 0
-                batch_size = key_value.size(0)
-                key_length = last_key_length + key_value.size(-2)
-                padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
-                kv_cache = self.get_kv_cache(
-                    batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
-                )
-                if self.multi_query:
-                    kv_cache[:, last_key_length:key_length, :].copy_(key_value)
-                key_value = kv_cache
-                if use_cache:
-                    present = key_length
-        else:
-            if layer_past is not None:
-                key_value = torch.cat((layer_past, key_value), dim=-2)
-            if use_cache:
-                present = key_value
-
-        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
-
-        attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
-
-        if not self.multi_query:
-            attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
-        attn_output = self.c_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
-
-        outputs = (attn_output, present)
-        if output_attentions:
-            if self.multi_query:
-                # Transpose to return weights in the usual format (batch_size, num_heads, query_length, key_length)
-                attn_weights = attn_weights.transpose(1, 2)
-            outputs += (attn_weights,)
-
-        return outputs  # a, present, (attentions)
 
 
 class GPTBigCodeMLP(nn.Module):
