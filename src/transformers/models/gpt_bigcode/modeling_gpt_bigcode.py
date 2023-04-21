@@ -107,7 +107,7 @@ def softmax_function(
     scale: float,
     softmax_dtype: torch.dtype,
     upcast: bool = True,
-    fused_softmax: bool = False,
+    fused_softmax: Optional[bool] = None,
 ):
     """
     This selects the appropriate (fused) (upcast) (masked) softmax method. Because of the way jit works, each case
@@ -116,6 +116,8 @@ def softmax_function(
     inefficient. TODO: Could have better fused kernels depending on scaling, dropout and head mask.
      Is it doable without writing 32 functions?
     """
+    if fused_softmax is None:
+        fused_softmax = x.size(-1) % 8 == 0
     if upcast:
         if mask is None:
             return (upcast_softmax_fused if fused_softmax else upcast_softmax)(x, scale, softmax_dtype)
@@ -185,7 +187,6 @@ class GPTBigCodeAttention(nn.Module):
         if self.attention_implementation == AttentionImplementation.BASE:
             self._attn_fn = self._attn_mqa if self.multi_query else self._attn_mha
         elif self.attention_implementation in TORCH_IMPLEMENTATIONS:
-            # TODO: Implement
             assert not self.pre_allocate_kv_cache
             self._attn_fn = self._attn_torch_mqa if self.multi_query else self._attn_torch_mha
             self.backend_context = (
@@ -198,7 +199,6 @@ class GPTBigCodeAttention(nn.Module):
                 )
             )
         elif self.attention_implementation == AttentionImplementation.FLASH:
-            # TODO: Implement
             assert not self.pre_allocate_kv_cache
             self._attn_fn = self._attn_flash_mqa if self.multi_query else self._attn_flash_mha
         elif self.attention_implementation == AttentionImplementation.OLD:
@@ -240,7 +240,7 @@ class GPTBigCodeAttention(nn.Module):
             unscale,
             softmax_dtype,
             upcast,
-            key.size(-1) % 8 == 0 if self.fused_softmax is None else self.fused_softmax,
+            self.fused_softmax,
         )
 
         attn_weights = self.attn_dropout(attn_weights)

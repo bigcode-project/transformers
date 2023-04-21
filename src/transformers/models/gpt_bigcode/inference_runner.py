@@ -5,7 +5,6 @@ import torch
 from transformers import GPTBigCodeConfig
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.gpt_bigcode.configuration_gpt_bigcode import (
-    TORCH_IMPLEMENTATIONS,
     AttentionImplementation,
     InferenceRunnerType,
 )
@@ -29,26 +28,11 @@ class GPTBigCodeInferenceRunner:
         self.n_layer = len(self.model.h)
 
         self.inference_runner_type = InferenceRunnerType(config.inference_runner)
-        self.attention_implementation = config.attention_implementation
         assert self.inference_runner_type != InferenceRunnerType.NO_RUNNER
-        assert self.attention_implementation in (
-            AttentionImplementation.BASE,
-            *TORCH_IMPLEMENTATIONS,
-            AttentionImplementation.FLASH,
-        )
         assert config.pre_allocate_kv_cache
         self.validate_input = config.validate_runner_input
         self.pad_key_length = 8 if config.pad_key_length else 1
-        self.fused_softmax = config.fused_softmax and self.attention_implementation == AttentionImplementation.BASE
-
-        if self.attention_implementation == AttentionImplementation.BASE:
-            self._forward_attn = self._forward_attn_base
-        elif self.attention_implementation in TORCH_IMPLEMENTATIONS:
-            self._forward_attn = self._forward_attn_torch
-        elif self.attention_implementation == AttentionImplementation.FLASH:
-            self._forward_attn = self._forward_attn_flash
-        else:
-            raise NotImplementedError(self.attention_implementation)
+        self.fused_softmax = True if config.fused_softmax is None and config.pad_key_length else config.fused_softmax
 
         # TODO: Support other attention types?
         assert model.multi_query
@@ -64,11 +48,7 @@ class GPTBigCodeInferenceRunner:
         self.softmax_dtype = torch.float32 if attn.attention_softmax_in_fp32 else self.dtype
         self.upcast = self.softmax_dtype != self.dtype
 
-        do_unscale = (
-            attn.scale_attention_softmax_in_fp32
-            and self.upcast
-            and self.attention_implementation == AttentionImplementation.BASE
-        )
+        do_unscale = attn.scale_attention_softmax_in_fp32 and self.upcast
         self.unscale = [i + 1.0 if do_unscale else 1.0 for i in range(self.n_layer)]
         scale = attn.head_dim**-0.5 if attn.scale_attn_weights else 1
         self.scale = [scale / unscale for unscale in self.unscale]
@@ -84,8 +64,7 @@ class GPTBigCodeInferenceRunner:
         # Attn weights: (batch_size, num_heads, key_length), no overlap with value (not needed for torch/flash attn)
         attn_weights_begin = _align_tensor(kv_end)
         attn_weights_end = attn_weights_begin
-        if self.attention_implementation == AttentionImplementation.BASE:
-            attn_weights_end += self.batch_size * attn.num_heads * self.max_sequence_length
+        attn_weights_end += self.batch_size * attn.num_heads * self.max_sequence_length
         # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
         # Also used for MLP projection
         c_proj_begin = _align_tensor(query_end)
@@ -151,10 +130,6 @@ class GPTBigCodeInferenceRunner:
         # QKV: (bs, embed_dim + 2 * kv_dim).
         self.c_attn = activation_pool[query_begin:kv_end].view(self.batch_size, -1)
         self.query = self.c_attn[:, : attn.embed_dim].view(self.batch_size, attn.num_heads, attn.head_dim)
-        # if self.attention_implementation==AttentionImplementation.FLASH:
-        #    self.query=query.view(self.batch_size * attn.num_heads, 1, attn.head_dim)
-        # else:
-        #    self.query=query.view(self.batch_size, attn.num_heads, attn.head_dim)
 
         self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
@@ -163,13 +138,7 @@ class GPTBigCodeInferenceRunner:
 
         # No transpose for torch/flash attn
         self.padded_keys = [
-            [
-                key[:, head_slice, :key_length, :].transpose(
-                    -1, -2 if self.attention_implementation == AttentionImplementation.BASE else -1
-                )
-                for key in keys
-            ]
-            for key_length in padded_key_lengths
+            [key[:, head_slice, :key_length, :].transpose(-1, -2) for key in keys] for key_length in padded_key_lengths
         ]
         self.padded_values = [
             [value[:, head_slice, :key_length, :] for value in values] for key_length in padded_key_lengths
@@ -183,22 +152,15 @@ class GPTBigCodeInferenceRunner:
             [kv_cache[:, head_slice, : key_length - 1, :] for kv_cache in kv_caches] for key_length in key_lengths
         ]
 
-        if self.attention_implementation == AttentionImplementation.BASE:
-            # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
-            attn_weights = activation_pool[attn_weights_begin:attn_weights_end].view(
-                self.batch_size, attn.num_heads, self.max_sequence_length
-            )
-            self.padded_attn_weights = [attn_weights[:, :, :key_length] for key_length in padded_key_lengths]
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value.
+        attn_weights = activation_pool[attn_weights_begin:attn_weights_end].view(
+            self.batch_size, attn.num_heads, self.max_sequence_length
+        )
+        self.padded_attn_weights = [attn_weights[:, :, :key_length] for key_length in padded_key_lengths]
 
-            # Attn outputs: (batch_size, embed_dim), no overlap with value.
-            self.attn_output = activation_pool[query_begin:query_end].view(self.batch_size, -1)
-            self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
-        elif self.attention_implementation == AttentionImplementation.FLASH:
-            self.cu_sq = torch.arange(
-                0, (self.batch_size + 1) * attn.num_heads, step=attn.num_heads, dtype=torch.int32, device=self.device
-            )
-            # self.cu_sk = torch.arange(0, (self.batch_size + 1) * self.max_sequence_length, step=self.max_sequence_length, dtype=torch.int32,
-            #                      device=self.device)
+        # Attn outputs: (batch_size, embed_dim), no overlap with value.
+        self.attn_output = activation_pool[query_begin:query_end].view(self.batch_size, -1)
+        self.attn_output_expanded = self.attn_output.view(self.batch_size, attn.num_heads, attn.head_dim)
         # Attn projection: (batch_size, embed_dim), no overlap with attn outputs.
         self.c_proj = activation_pool[c_proj_begin:c_proj_end].view(self.batch_size, -1)
 
@@ -244,7 +206,7 @@ class GPTBigCodeInferenceRunner:
         # We need to warmup the jit function before creating the graph, otherwise it will crash.
         # https://github.com/pytorch/pytorch/issues/99397
         # Warmup needs to be done for every input shape (key length), and for both scale == 1 and scale != 1
-        if self.attention_implementation == AttentionImplementation.BASE and self.fused_softmax:
+        if self.fused_softmax or (self.fused_softmax is None and key_length % 8 == 0):
             for scale in (1.0, 2.0):
                 softmax_function(
                     self.padded_attn_weights[key_length],
@@ -299,7 +261,7 @@ class GPTBigCodeInferenceRunner:
             self.unscale[layer_idx],
             self.softmax_dtype,
             self.upcast,
-            block.attn.self.fused_softmax,
+            self.fused_softmax,
         )
 
         torch.bmm(attn_weights, self.padded_values[key_length][layer_idx], out=self.attn_output_expanded)
