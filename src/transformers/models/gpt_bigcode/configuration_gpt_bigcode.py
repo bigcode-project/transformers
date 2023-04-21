@@ -155,6 +155,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         eos_token_id=50256,
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
+        fused_softmax=None,
         multi_query=True,
         attention_implementation=AttentionImplementation.BASE,
         inference_runner=InferenceRunnerType.NO_RUNNER,
@@ -181,6 +182,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.attention_softmax_in_fp32 = attention_softmax_in_fp32
         self.scale_attention_softmax_in_fp32 = scale_attention_softmax_in_fp32
+        self.fused_softmax = fused_softmax
         self.multi_query = multi_query
         self.attention_implementation = attention_implementation
 

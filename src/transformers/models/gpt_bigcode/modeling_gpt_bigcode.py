@@ -60,11 +60,6 @@ GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
-# Fused kernels
-# Use separate functions for each case because conditionals prevent kernel fusion.
-# TODO: Could have better fused kernels depending on scaling, dropout and head mask.
-#  Is it doable without writing 32 functions?
-@torch.jit.script
 def upcast_masked_softmax(
     x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor, scale: float, softmax_dtype: torch.dtype
 ):
@@ -76,6 +71,12 @@ def upcast_masked_softmax(
 
 
 @torch.jit.script
+def upcast_masked_softmax_fused(
+    x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor, scale: float, softmax_dtype: torch.dtype
+):
+    return upcast_masked_softmax(x, mask, mask_value, scale, softmax_dtype)
+
+
 def upcast_softmax(x: torch.Tensor, scale: float, softmax_dtype: torch.dtype):
     input_dtype = x.dtype
     x = x.to(softmax_dtype) * scale
@@ -84,10 +85,49 @@ def upcast_softmax(x: torch.Tensor, scale: float, softmax_dtype: torch.dtype):
 
 
 @torch.jit.script
+def upcast_softmax_fused(x: torch.Tensor, scale: float, softmax_dtype: torch.dtype):
+    return upcast_softmax(x, scale, softmax_dtype)
+
+
 def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor):
     x = torch.where(mask, x, mask_value)
     x = torch.nn.functional.softmax(x, dim=-1)
     return x
+
+
+@torch.jit.script
+def masked_softmax_fused(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor):
+    return masked_softmax(x, mask, mask_value)
+
+
+def softmax_function(
+    x: torch.Tensor,
+    mask: torch.Tensor,
+    mask_value: torch.Tensor,
+    scale: float,
+    softmax_dtype: torch.dtype,
+    upcast: bool = True,
+    fused_softmax: bool = False,
+):
+    """
+    This selects the appropriate (fused) (upcast) (masked) softmax method. Because of the way jit works, each case
+    needs to be handled through a separate method. The fused kernels remove most of the overhead from masking, casting
+    and scaling, but only work well when the key length is a multiple of 8. For other key lengths, it is extremely
+    inefficient. TODO: Could have better fused kernels depending on scaling, dropout and head mask.
+     Is it doable without writing 32 functions?
+    """
+    if upcast:
+        if mask is None:
+            return (upcast_softmax_fused if fused_softmax else upcast_softmax)(x, scale, softmax_dtype)
+        else:
+            return (upcast_masked_softmax_fused if fused_softmax else upcast_masked_softmax)(
+                x, mask, mask_value, scale, softmax_dtype
+            )
+    else:
+        if mask is None:
+            return torch.nn.functional.softmax(x, dim=-1)
+        else:
+            return (masked_softmax_fused if fused_softmax else masked_softmax)(x, mask, mask_value)
 
 
 class GPTBigCodeAttention(nn.Module):
@@ -118,6 +158,7 @@ class GPTBigCodeAttention(nn.Module):
         self.scale_attention_softmax_in_fp32 = (
             config.scale_attention_softmax_in_fp32 and config.attention_softmax_in_fp32
         )
+        self.fused_softmax = config.fused_softmax
 
         # KV caching and padding
         self.kv_cache = None
@@ -192,22 +233,15 @@ class GPTBigCodeAttention(nn.Module):
             beta = 0
         attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
 
-        if upcast:
-            # Use a fused kernel to prevent a large overhead from casting and scaling.
-            # Sub-optimal when the key length is not a multiple of 8.
-            if attention_mask is None:
-                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
-            else:
-                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
-        else:
-            if attention_mask is not None:
-                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-
-                # The fused kernel is very slow when the key length is not a multiple of 8, so we skip fusion.
-                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
-
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = softmax_function(
+            attn_weights,
+            attention_mask,
+            None if attention_mask is None else self._get_mask_value(attn_weights.device, softmax_dtype),
+            unscale,
+            softmax_dtype,
+            upcast,
+            key.size(-1) % 8 == 0 if self.fused_softmax is None else self.fused_softmax,
+        )
 
         attn_weights = self.attn_dropout(attn_weights)
 

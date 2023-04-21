@@ -9,7 +9,7 @@ from transformers.models.gpt_bigcode.configuration_gpt_bigcode import (
     AttentionImplementation,
     InferenceRunnerType,
 )
-from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, masked_softmax, upcast_masked_softmax
+from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, softmax_function
 
 
 try:
@@ -39,6 +39,7 @@ class GPTBigCodeInferenceRunner:
         assert config.pre_allocate_kv_cache
         self.validate_input = config.validate_runner_input
         self.pad_key_length = 8 if config.pad_key_length else 1
+        self.fused_softmax = config.fused_softmax and self.attention_implementation == AttentionImplementation.BASE
 
         if self.attention_implementation == AttentionImplementation.BASE:
             self._forward_attn = self._forward_attn_base
@@ -243,21 +244,16 @@ class GPTBigCodeInferenceRunner:
         # We need to warmup the jit function before creating the graph, otherwise it will crash.
         # https://github.com/pytorch/pytorch/issues/99397
         # Warmup needs to be done for every input shape (key length), and for both scale == 1 and scale != 1
-        if self.attention_implementation == AttentionImplementation.BASE:
-            if self.upcast:
-                for scale in (1.0, 2.0):
-                    upcast_masked_softmax(
-                        self.padded_attn_weights[key_length],
-                        self.padded_attn_masks[key_length],
-                        self.mask_value,
-                        scale,
-                        self.softmax_dtype,
-                    )
-            else:
-                masked_softmax(
+        if self.attention_implementation == AttentionImplementation.BASE and self.fused_softmax:
+            for scale in (1.0, 2.0):
+                softmax_function(
                     self.padded_attn_weights[key_length],
                     self.padded_attn_masks[key_length],
                     self.mask_value,
+                    scale,
+                    self.softmax_dtype,
+                    self.upcast,
+                    self.fused_softmax,
                 )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.memory_pool):
@@ -295,18 +291,16 @@ class GPTBigCodeInferenceRunner:
             alpha=self.scale[layer_idx],
             out=attn_weights,
         )
-        # Use a fused kernel to prevent a large overhead from casting and scaling.
         # Jit doesn't allow inplace kernel.
-        if self.upcast:
-            attn_weights = upcast_masked_softmax(
-                attn_weights,
-                self.padded_attn_masks[key_length],
-                self.mask_value,
-                self.unscale[layer_idx],
-                self.softmax_dtype,
-            )
-        else:
-            attn_weights = masked_softmax(attn_weights, self.padded_attn_masks[key_length], self.mask_value)
+        attn_weights = softmax_function(
+            attn_weights,
+            self.padded_attn_masks[key_length],
+            self.mask_value,
+            self.unscale[layer_idx],
+            self.softmax_dtype,
+            self.upcast,
+            block.attn.self.fused_softmax,
+        )
 
         torch.bmm(attn_weights, self.padded_values[key_length][layer_idx], out=self.attn_output_expanded)
 
