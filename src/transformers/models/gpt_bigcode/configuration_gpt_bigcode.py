@@ -164,6 +164,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         max_sequence_length=None,
         max_batch_size=None,
         pad_key_length=True,
+        predict_last_token: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -200,5 +201,8 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.max_batch_size = max_batch_size
         # Pad key length to a multiple of 8 (requires pre_allocate_kv_cache).
         self.pad_key_length = pad_key_length
+
+        # Predict only the last token in inference even if the input is bigger.
+        self.predict_last_token = predict_last_token
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
