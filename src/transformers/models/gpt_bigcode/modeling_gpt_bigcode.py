@@ -41,7 +41,6 @@ from .configuration_gpt_bigcode import (
 
 
 try:
-    # TODO: This needs einops.
     from flash_attn.bert_padding import pad_input, unpad_input
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
@@ -313,45 +312,6 @@ class GPTBigCodeAttention(nn.Module):
 
         return attn_output, None
 
-    def _get_attn_weights(self, query, key, attn_view, attn_shape, attention_mask=None, head_mask=None):
-        dtype = query.dtype
-        softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
-        upcast = dtype != softmax_dtype
-
-        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
-        scale_factor = unscale**-1
-        if self.scale_attn_weights:
-            scale_factor /= self.head_dim**0.5
-
-        attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
-        if query.device.type == "cpu":
-            # This is needed because of a bug in pytorch https://github.com/pytorch/pytorch/issues/80588.
-            # The bug was fixed in https://github.com/pytorch/pytorch/pull/96086,
-            # but the fix has not been released as of pytorch version 2.0.0.
-            attn_weights.zero_()
-            beta = 1
-        else:
-            beta = 0
-        attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
-
-        attn_weights = softmax_function(
-            attn_weights,
-            attention_mask,
-            None if attention_mask is None else self._get_mask_value(attn_weights.device, softmax_dtype),
-            unscale,
-            softmax_dtype,
-            upcast,
-            self.fused_softmax,
-        )
-
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
-
-        return attn_weights
-
     def freeze_kv_cache(self, enable=True):
         if self.kv_cache is None:
             raise RuntimeError("KV cache not found.")
@@ -387,64 +347,7 @@ class GPTBigCodeAttention(nn.Module):
         )
         return kv_cache[:, 0, :sequence_length, :] if self.multi_query else kv_cache[:, :, :sequence_length, :]
 
-    def _merge_kv_caches(self, key_value, layer_past):
-        if self.pre_allocate_kv_cache:
-            last_key_length = layer_past or 0
-            batch_size = key_value.size(0)
-            key_length = last_key_length + key_value.size(-2)
-            padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
-            kv_cache = self.get_kv_cache(
-                batch_size, padded_key_length, key_value.device, key_value.dtype, allocate=last_key_length == 0
-            )
-            if self.multi_query:
-                kv_cache[:, last_key_length:key_length, :].copy_(key_value)
-            key_value = kv_cache
-            present = key_length
-        else:
-            if layer_past is not None:
-                key_value = torch.cat((layer_past, key_value), dim=-2)
-            present = key_value
-        return key_value, present
-
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        layer_past: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-    ) -> Union[
-        Tuple[torch.Tensor, Optional[torch.Tensor]],
-        Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
-    ]:
-        if encoder_hidden_states is not None or encoder_attention_mask is not None:
-            raise NotImplementedError("Cross-attention is not supported for gpt_bigcode.")
-
-        if self.flash_attention:
-            attn_fn = self._attn_flash
-        else:
-            attn_fn = self._attn_mqa if self.multi_query else self._attn_mha
-
-        attn_output, present, attn_weights = attn_fn(hidden_states, layer_past, use_cache, attention_mask, head_mask)
-
-        attn_output = self.c_proj(attn_output)
-        attn_output = self.resid_dropout(attn_output)
-
-        outputs = (attn_output, present)
-        if output_attentions:
-            if attn_weights is None:
-                raise NotImplementedError("`output_attentions` not supported.")
-            if self.multi_query:
-                # Transpose to return weights in the usual format (batch_size, num_heads, query_length, key_length)
-                attn_weights = attn_weights.transpose(1, 2)
-            outputs += (attn_weights,)
-
-        return outputs  # a, present, (attentions)
-
-    def _old_forward(
         self,
         hidden_states: torch.Tensor,
         layer_past: Optional[torch.Tensor] = None,
@@ -525,6 +428,7 @@ class GPTBigCodeAttention(nn.Module):
             outputs += (attn_weights,)
 
         return outputs  # a, present, (attentions)
+
 
 class GPTBigCodeMLP(nn.Module):
     def __init__(self, intermediate_size, config):

@@ -10,12 +10,6 @@ from transformers.models.gpt_bigcode.configuration_gpt_bigcode import (
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, softmax_function
 
 
-try:
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
-except ImportError:
-    flash_attn_unpadded_func = None
-
-
 def _align_tensor(x):
     return x + -x % 128
 
@@ -60,10 +54,9 @@ class GPTBigCodeInferenceRunner:
         query_end = query_begin + self.batch_size * attn.embed_dim
         # KV: (bs, 2 * kv_dim), combines with query into c_attn.
         kv_end = query_end + 2 * self.batch_size * attn.kv_dim
-        # Attn weights: (batch_size, num_heads, key_length), no overlap with value (not needed for torch/flash attn)
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value
         attn_weights_begin = _align_tensor(kv_end)
-        attn_weights_end = attn_weights_begin
-        attn_weights_end += self.batch_size * attn.num_heads * self.max_sequence_length
+        attn_weights_end = attn_weights_begin + self.batch_size * attn.num_heads * self.max_sequence_length
         # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
         # Also used for MLP projection
         c_proj_begin = _align_tensor(query_end)
@@ -129,13 +122,11 @@ class GPTBigCodeInferenceRunner:
         # QKV: (bs, embed_dim + 2 * kv_dim).
         self.c_attn = activation_pool[query_begin:kv_end].view(self.batch_size, -1)
         self.query = self.c_attn[:, : attn.embed_dim].view(self.batch_size, attn.num_heads, attn.head_dim)
-
         self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
         keys, values = zip(*(kv_cache.split((attn.head_dim, attn.head_dim), dim=-1) for kv_cache in kv_caches))
         head_slice = 0 if attn.multi_query else slice(None)
 
-        # No transpose for torch/flash attn
         self.padded_keys = [
             [key[:, head_slice, :key_length, :].transpose(-1, -2) for key in keys] for key_length in padded_key_lengths
         ]
