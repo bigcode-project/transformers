@@ -139,9 +139,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         inference_runner=InferenceRunnerType.NO_RUNNER,
         validate_runner_input=True,
         pre_allocate_kv_cache=False,
-        max_sequence_length=None,
-        max_batch_size=None,
-        pad_key_length=True,
+        pad_key_length=None,
         predict_last_token: bool = False,
         **kwargs,
     ):
@@ -172,12 +170,10 @@ class GPTBigCodeConfig(PretrainedConfig):
         # Set to False to disable input validation of safe inputs, for a small speedup.
         self.validate_runner_input = validate_runner_input
 
+        # Pre-allocate to sequence length `n_positions` (`True`) or the specified value (`int`)
         self.pre_allocate_kv_cache = pre_allocate_kv_cache
         # The max sequence length for the pre-allocated KV cache (`n_positions` if not provided).
-        self.max_sequence_length = max_sequence_length
-        # The max batch size for the pre-allocated KV cache, (deduce from input if not provided).
-        self.max_batch_size = max_batch_size
-        # Pad key length to a multiple of 8 (requires pre_allocate_kv_cache).
+        # Pad key length to a multiple of 8.
         self.pad_key_length = pad_key_length
 
         # Predict only the last token in inference even if the input is bigger.

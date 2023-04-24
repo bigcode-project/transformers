@@ -138,7 +138,7 @@ class GPTBigCodeAttention(nn.Module):
         self.mask_value = None
 
         self.multi_query = config.multi_query
-        # TODO: chack availability
+        self.seq_dim = -2 if self.multi_query else -1
         self.flash_attention = config.flash_attention
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -163,12 +163,11 @@ class GPTBigCodeAttention(nn.Module):
         self.fused_softmax = config.fused_softmax
 
         # KV caching and padding
-        self.kv_cache = None
-        self.kv_cache_max_batch_size = config.max_batch_size or 0
-        self.kv_cache_max_sequence_length = config.max_sequence_length or config.n_positions
-        self.pre_allocate_kv_cache = config.pre_allocate_kv_cache
-        self.pad_key_length = config.pad_key_length and config.pre_allocate_kv_cache
-        self._frozen_kv_cache = False
+        self.pre_allocate_kv_cache = (
+            config.n_embd if config.pre_allocate_kv_cache is True else config.pre_allocate_kv_cache
+        )
+        self.pad_key_length = config.pre_allocate_kv_cache if config.pad_key_length is None else config.pad_key_length
+        self._tuple_cache_format = self.pre_allocate_kv_cache or self.pad_key_length or self.flash_attention
 
         if self.is_cross_attention:
             raise NotImplementedError("Cross-attention is not supported for gpt_bigcode.")
@@ -191,9 +190,6 @@ class GPTBigCodeAttention(nn.Module):
             if self.pre_allocate_kv_cache:
                 raise ValueError("KV cache pre-allocation is not supported with Flash Attention")
             assert not self.pre_allocate_kv_cache
-            self._attn_fn = self._attn_flash
-        else:
-            self._attn_fn = self._attn_mqa if self.multi_query else self._attn_mha
 
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
@@ -312,40 +308,99 @@ class GPTBigCodeAttention(nn.Module):
 
         return attn_output, None
 
-    def freeze_kv_cache(self, enable=True):
-        if self.kv_cache is None:
-            raise RuntimeError("KV cache not found.")
-        # Prevent re-allocation of the KV cache.
-        self._frozen_kv_cache = enable
+    def _re_allocate_kv_cache(self, kv_cache, key_length, padded_key_length, allocate_key_length):
+        batch_size = kv_cache.size(-1)
+        assert not self.training
+        if self.multi_query:
+            allocated_kv_cache = torch.empty(
+                [batch_size, allocate_key_length, self.head_dim], dtype=kv_cache.dtype, device=kv_cache.device
+            )
+            allocated_kv_cache[:, :key_length].copy_(kv_cache)
+            padded_kv_cache = allocated_kv_cache[:, :padded_key_length]
+        else:
+            allocated_kv_cache = torch.empty(
+                [batch_size, self.num_heads, allocate_key_length, self.head_dim],
+                dtype=kv_cache.dtype,
+                device=kv_cache.device,
+            )
+            allocated_kv_cache[:, :, key_length].copy_(kv_cache)
+            padded_kv_cache = allocated_kv_cache[:, :, :padded_key_length]
+        return allocated_kv_cache, padded_kv_cache
 
-    def get_kv_cache(self, batch_size, sequence_length, device, dtype, allocate=True):
-        if (
-            self.kv_cache is None
-            or self.kv_cache.dtype != dtype
-            or self.kv_cache.device != device
-            or batch_size > self.kv_cache_max_batch_size
-            or sequence_length > self.kv_cache_max_sequence_length
-        ):
-            if self._frozen_kv_cache or not allocate:
-                if self.kv_cache is None:
-                    raise RuntimeError("KV cache not found.")
-                else:
-                    raise RuntimeError(
-                        f"Invalid KV cache: "
-                        f"existing = {(self.kv_cache.dtype,self.kv_cache.device,self.kv_cache_max_batch_size,self.kv_cache_max_sequence_length)}, "
-                        f"requested = {(dtype,device,batch_size,sequence_length)}"
-                    )
-            # Free memory first.
-            self.kv_cache = None
-            self.kv_cache_max_sequence_length = max(sequence_length, self.kv_cache_max_sequence_length)
-            self.kv_cache_max_batch_size = max(batch_size, self.kv_cache_max_batch_size)
-            kv_cache_size = 2 * self.kv_cache_max_batch_size * self.kv_cache_max_sequence_length * self.kv_dim
-            self.kv_cache = torch.empty([kv_cache_size], device=device, dtype=dtype)
-        # This view ensures the cache is contiguous for all batch sizes.
-        kv_cache = self.kv_cache[: 2 * batch_size * self.kv_cache_max_sequence_length * self.kv_dim].view(
-            batch_size, self.kv_heads, self.kv_cache_max_sequence_length, 2 * self.head_dim
-        )
-        return kv_cache[:, 0, :sequence_length, :] if self.multi_query else kv_cache[:, :, :sequence_length, :]
+    def _merge_kv_caches(self, key_value, use_cache, layer_past, attention_mask):
+        flash_attention = self.flash_attention and not layer_past
+
+        # Convert to standard KV cache format.
+        if flash_attention and use_cache:
+            _, padding_index, batch_size, max_sequence_length = attention_mask
+            current_kv_cache = pad_input(key_value, padding_index, batch_size, max_sequence_length)
+            if not self.multi_query:
+                current_kv_cache = current_kv_cache.view(
+                    batch_size, max_sequence_length, self.num_heads, 2 * self.head_dim
+                ).transpose(1, 2)
+        else:
+            current_kv_cache = key_value
+
+        # Calculate dimensions and recover layer_past
+        batch_size = current_kv_cache.size(0)
+        query_length = current_kv_cache.size(self.seq_dim)
+        if layer_past is None:
+            allocated_kv_cache, last_key_length = None, 0
+            last_kv_cache = None
+            key_length = query_length
+            allocated_key_length = key_length
+        else:
+            allocated_kv_cache, last_key_length = layer_past
+            last_kv_cache = (
+                allocated_kv_cache[:, :last_key_length]
+                if self.multi_query
+                else allocated_kv_cache[:, :, :last_key_length]
+            )
+            key_length = query_length + last_key_length
+            allocated_key_length = allocated_kv_cache.size(self.seq_dim)
+
+        padded_key_length = key_length if flash_attention else attention_mask.size(self.seq_dim)
+        allocate_key_length = padded_key_length if use_cache else max(self.pre_allocate_kv_cache, padded_key_length)
+
+        # Re-allocate kv cache and copy last value
+        if allocate_key_length > allocated_key_length:
+            if self.multi_query:
+                allocated_kv_cache = torch.empty(
+                    [batch_size, allocate_key_length, self.head_dim],
+                    dtype=current_kv_cache.dtype,
+                    device=current_kv_cache.device,
+                )
+                if layer_past is not None:
+                    allocated_kv_cache[:, :last_key_length].copy_(last_kv_cache)
+            else:
+                allocated_kv_cache = torch.empty(
+                    [batch_size, self.num_heads, allocate_key_length, self.head_dim],
+                    dtype=current_kv_cache.dtype,
+                    device=current_kv_cache.device,
+                )
+                if layer_past is not None:
+                    allocated_kv_cache[:, :, :last_key_length].copy_(last_kv_cache)
+
+        # Copy the new values.
+        if allocate_key_length > allocated_key_length or layer_past is not None:
+            if self.multi_query:
+                allocated_kv_cache[:, last_key_length:key_length].copy_(current_kv_cache)
+                padded_kv_cache = allocated_kv_cache[:, :padded_key_length]
+            else:
+                allocated_kv_cache[:, :, last_key_length:key_length].copy_(current_kv_cache)
+                padded_kv_cache = allocated_kv_cache[:, :, :padded_key_length]
+            if not flash_attention:
+                # Use the merged KV cache.
+                # Not needed when layer_past is None but frees some memory.
+                key_value = padded_kv_cache
+
+        if use_cache:
+            if allocated_kv_cache is None:
+                allocated_kv_cache = current_kv_cache
+            present = allocated_kv_cache, key_length
+        else:
+            present = None
+        return key_value, present
 
     def forward(
         self,
@@ -373,39 +428,14 @@ class GPTBigCodeAttention(nn.Module):
                 .split((self.head_dim, 2 * self.head_dim), dim=3)
             )
 
-        present = None
-
-        if flash_attention and use_cache:
-            # Unpad and convert to KV cache format.
-            # Todo: unpadding is only needed if the cache is reused.
-            _, padding_index, batch_size, max_sequence_length = attention_mask
-            kv_cache = pad_input(key_value, padding_index, batch_size, max_sequence_length)
-            if not self.multi_query:
-                kv_cache = kv_cache.view(*hidden_states.shape[:2], self.num_heads, 2 * self.head_dim).transpose(1, 2)
+        if self._tuple_cache_format:
+            # present =  (allocated_kv_cache, key_length)
+            key_value, present = self._merge_kv_caches(key_value, use_cache, layer_past, attention_mask)
         else:
-            kv_cache = key_value
-        if self.pre_allocate_kv_cache:
-            if use_cache or layer_past is not None:
-                last_key_length = layer_past or 0
-                batch_size = kv_cache.size(0)
-                key_length = last_key_length + kv_cache.size(-2 if self.multi_query else -1)
-                padded_key_length = key_length + -key_length % (8 if self.pad_key_length else 1)
-                kv_cache_ = self.get_kv_cache(
-                    batch_size, padded_key_length, kv_cache.device, kv_cache.dtype, allocate=last_key_length == 0
-                )
-                if self.multi_query:
-                    kv_cache_[:, last_key_length:key_length, :].copy_(kv_cache)
-                else:
-                    kv_cache_[:, :, last_key_length:key_length, :].copy_(kv_cache)
-                present = key_length if use_cache else None
-                if not flash_attention:
-                    # Not needed when layer_past is None but frees some memory.
-                    key_value = kv_cache_
-        else:
+            # present = key_value
             if layer_past is not None:
-                kv_cache = torch.cat((layer_past, key_value), dim=-2)
-                key_value = kv_cache
-            present = kv_cache if use_cache else None
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            present = key_value if use_cache else None
 
         key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
@@ -662,8 +692,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
-        self.pre_allocate_kv_cache = config.pre_allocate_kv_cache
-        self.pad_key_length = config.pad_key_length and self.pre_allocate_kv_cache
+        self.pad_key_length = config.pre_allocate_kv_cache if config.pad_key_length is None else config.pad_key_length
+        self._tuple_cache_format = config.pre_allocate_kv_cache or self.pad_key_length or config.flash_attention
         self.inference_runner_type = InferenceRunnerType(config.inference_runner)
 
         self.flash_attention = config.flash_attention
@@ -791,8 +821,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         if past_key_values is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.h))
-        elif self.pre_allocate_kv_cache:
-            past_length = past_key_values[0]
+        elif self._tuple_cache_format:
+            past_length = past_key_values[0][1]
         else:
             past_length = past_key_values[0].size(-2)
         key_length = past_length + query_length
