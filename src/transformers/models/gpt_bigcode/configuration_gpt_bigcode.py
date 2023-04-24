@@ -40,28 +40,6 @@ class InferenceRunnerType(IntEnum):
     FULL_GRAPH = 3
 
 
-class AttentionImplementation(IntEnum):
-    # Ours
-    BASE = 0
-    # Flash attention
-    FLASH = 1
-    # scaled_dot_product_attention (multiple implementations)
-    TORCH = 2
-    TORCH_FLASH = 3
-    TORCH_MEM = 4
-    TORCH_CPP = 5
-    # DEBUG
-    OLD = 6
-
-
-TORCH_IMPLEMENTATIONS = (
-    AttentionImplementation.TORCH,
-    AttentionImplementation.TORCH_FLASH,
-    AttentionImplementation.TORCH_MEM,
-    AttentionImplementation.TORCH_CPP,
-)
-
-
 class GPTBigCodeConfig(PretrainedConfig):
     """
     This is the configuration class to store the configuration of a [`GPTBigCodeModel`]. It is used to instantiate a
@@ -157,7 +135,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         scale_attention_softmax_in_fp32=True,
         fused_softmax=None,
         multi_query=True,
-        attention_implementation=AttentionImplementation.BASE,
+        flash_attention=False,
         inference_runner=InferenceRunnerType.NO_RUNNER,
         validate_runner_input=True,
         pre_allocate_kv_cache=False,
@@ -185,7 +163,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.scale_attention_softmax_in_fp32 = scale_attention_softmax_in_fp32
         self.fused_softmax = fused_softmax
         self.multi_query = multi_query
-        self.attention_implementation = attention_implementation
+        self.flash_attention = flash_attention
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
