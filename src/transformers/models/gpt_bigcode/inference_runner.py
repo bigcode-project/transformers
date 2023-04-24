@@ -240,7 +240,7 @@ class GPTBigCodeInferenceRunner:
             out=self.c_attn,
         )
 
-    def _forward_attn_base(self, block, key_length):
+    def _forward_attn(self, block, key_length):
         layer_idx = block.attn.layer_idx
         self.current_key_values[key_length][layer_idx].copy_(self.kv_attn)
         attn_weights = self.padded_attn_weights[key_length]
@@ -266,50 +266,6 @@ class GPTBigCodeInferenceRunner:
 
         torch.bmm(attn_weights, self.padded_values[key_length][layer_idx], out=self.attn_output_expanded)
 
-    def _forward_attn_torch(self, block, key_length):
-        layer_idx = block.attn.layer_idx
-        self.current_key_values[key_length][layer_idx].copy_(self.kv_attn)
-        with block.attn.backend_context():
-            attn_output = torch.nn.functional.scaled_dot_product_attention(
-                self.query,
-                self.padded_keys[key_length][layer_idx],
-                self.padded_values[key_length][layer_idx],
-                None,  # attention_mask,
-                0.0,
-                is_causal=False,
-            )
-        # Out arg not supported so we set the variable instead.
-        self.attn_output = attn_output.view(self.batch_size, -1)
-
-    def _forward_attn_flash(self, block, key_length):
-        layer_idx = block.attn.layer_idx
-        num_heads = block.attn.num_heads
-        self.current_key_values[key_length][layer_idx].copy_(self.kv_attn)
-        # TODO: Pre-allocate?
-        # TODO: Adjust for non-contiguous key/value? (max seq len instead of key length)
-        cu_sk = torch.arange(
-            0, (self.batch_size + 1) * key_length, step=key_length, dtype=torch.int32, device=self.device
-        )
-        # TODO: Avoid reshape
-        q = self.query.reshape(self.batch_size * num_heads, 1, block.attn.head_dim)
-        k = self.padded_keys[key_length][layer_idx].reshape(self.batch_size * key_length, 1, block.attn.head_dim)
-        v = self.padded_values[key_length][layer_idx].reshape(self.batch_size * key_length, 1, block.attn.head_dim)
-        print("A", q.shape, k.shape, v.shape)
-        attn_output = flash_attn_unpadded_func(
-            q,
-            k,
-            v,
-            self.cu_sq,
-            cu_sk,
-            num_heads,
-            key_length,
-            0.0,
-            softmax_scale=self.scale[layer_idx],
-            causal=False,
-        )
-        # Out arg not supported so we set the variable instead.
-        self.attn_output = attn_output.view(self.batch_size, -1)
-
     def _forward_post_attn(self, block):
         torch.nn.functional.linear(
             self.attn_output,
@@ -317,9 +273,6 @@ class GPTBigCodeInferenceRunner:
             block.attn.c_proj.bias,
             out=self.c_proj,
         )
-        if self.attention_implementation != AttentionImplementation.BASE:
-            # Free memory.
-            del self.attn_output
         self.hidden_states_squeezed.add_(self.c_proj)
         # LN doesn't support out argument.
         hidden_states = block.ln_2(self.hidden_states_squeezed)
