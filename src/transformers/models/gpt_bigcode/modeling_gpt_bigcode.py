@@ -202,6 +202,117 @@ class GPTBigCodeAttention(nn.Module):
             self.mask_value = torch.full([], torch.finfo(dtype).min, dtype=dtype, device=device)
         return self.mask_value
 
+    def _attn(self, query, key, value, attention_mask, head_mask=None):
+        dtype = query.dtype
+        softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
+        upcast = dtype != softmax_dtype
+
+        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
+        scale_factor = unscale**-1
+        if self.scale_attn_weights:
+            scale_factor /= self.head_dim**0.5
+
+        # MQA models: (batch_size, query_length, num_heads * head_dim)
+        # MHA models: (batch_size, num_heads, query_length, head_dim)
+        query_shape = query.shape
+        batch_size = query_shape[0]
+        key_length = key.size(-2)
+
+        key = key.transpose(-1, -2)
+        if self.multi_query:
+            # (batch_size, query_length, num_heads, head_dim) x (batch_size, head_dim, key_length)
+            # -> (batch_size, query_length, num_heads, key_length)
+            query_length = query_shape[1]
+            attn_shape = (batch_size, query_length, self.num_heads, key_length)
+            attn_view = (batch_size, query_length * self.num_heads, key_length)
+            # No copy needed for MQA 2, or when layer_past is provided.
+            query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+        else:
+            # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
+            # -> (batch_size, num_heads, query_length, key_length)
+            query_length = query_shape[2]
+            attn_shape = (batch_size, self.num_heads, query_length, key_length)
+            attn_view = (batch_size * self.num_heads, query_length, key_length)
+            # Always copies
+            query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
+            # No copy when layer_past is provided.
+            key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
+
+        attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
+        if query.device.type == "cpu":
+            # This is needed because of a bug in pytorch https://github.com/pytorch/pytorch/issues/80588.
+            # The bug was fixed in https://github.com/pytorch/pytorch/pull/96086,
+            # but the fix has not been released as of pytorch version 2.0.0.
+            attn_weights.zero_()
+            beta = 1
+        else:
+            beta = 0
+        attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
+
+        if upcast:
+            # Use a fused kernel to prevent a large overhead from casting and scaling.
+            # Sub-optimal when the key length is not a multiple of 8.
+            if attention_mask is None:
+                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
+            else:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
+        else:
+            if attention_mask is not None:
+                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
+
+                # The fused kernel is very slow when the key length is not a multiple of 8, so we skip fusion.
+                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
+
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+        attn_weights = self.attn_dropout(attn_weights)
+
+        # Mask heads if we want to
+        if head_mask is not None:
+            if self.multi_query:
+                head_mask = head_mask.transpose(1, 2)
+            attn_weights = attn_weights * head_mask
+
+        if self.multi_query:
+            attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
+        else:
+            attn_output = torch.matmul(attn_weights, value)
+
+        return attn_output, attn_weights
+
+    def _attn_flash(self, query, key, value, attention_mask, head_mask=None):
+        if head_mask is not None:
+            raise NotImplementedError("Head mask is not supported with flash attention.")
+
+        query_shape = query.shape
+        attn_shape = query_shape[0], self.num_heads, self.head_dim
+        query = query.view(attn_shape)
+        if self.multi_query:
+            key = key.unsqueeze(1).expand(attn_shape)
+            value = value.unsqueeze(1).expand(attn_shape)
+        else:
+            key = key.view(attn_shape)
+            value = value.view(attn_shape)
+
+        sequence_lengths, padding_index, _, max_sequence_length = attention_mask
+
+        # attn_output: (sum_seq_len, num_heads * head_dim)
+        attn_output = flash_attn_unpadded_func(
+            query,
+            key,
+            value,
+            sequence_lengths,
+            sequence_lengths,
+            max_sequence_length,
+            max_sequence_length,
+            self.dropout_p if self.training else 0.0,
+            softmax_scale=self.head_dim**-0.5 if self.scale_attn_weights else 1,
+            causal=True,
+        ).view(query_shape)
+
+        return attn_output, None
+
     def _get_attn_weights(self, query, key, attn_view, attn_shape, attention_mask=None, head_mask=None):
         dtype = query.dtype
         softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
@@ -414,118 +525,6 @@ class GPTBigCodeAttention(nn.Module):
             outputs += (attn_weights,)
 
         return outputs  # a, present, (attentions)
-
-    def _attn_flash(self, query, key, value, attention_mask, head_mask=None):
-        if head_mask is not None:
-            raise NotImplementedError("Head mask is not supported with flash attention.")
-
-        query_shape = query.shape
-        attn_shape = query_shape[0], self.num_heads, self.head_dim
-        query = query.view(attn_shape)
-        if self.multi_query:
-            key = key.unsqueeze(1).expand(attn_shape)
-            value = value.unsqueeze(1).expand(attn_shape)
-        else:
-            key = key.view(attn_shape)
-            value = value.view(attn_shape)
-
-        sequence_lengths, padding_index, _, max_sequence_length = attention_mask
-
-        # attn_output: (sum_seq_len, num_heads * head_dim)
-        attn_output = flash_attn_unpadded_func(
-            query,
-            key,
-            value,
-            sequence_lengths,
-            sequence_lengths,
-            max_sequence_length,
-            max_sequence_length,
-            self.dropout_p if self.training else 0.0,
-            softmax_scale=self.head_dim**-0.5 if self.scale_attn_weights else 1,
-            causal=True,
-        ).view(query_shape)
-
-        return attn_output, None
-
-    def _attn(self, query, key, value, attention_mask, head_mask=None):
-        dtype = query.dtype
-        softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
-        upcast = dtype != softmax_dtype
-
-        unscale = self.layer_idx + 1 if self.scale_attention_softmax_in_fp32 and upcast else 1
-        scale_factor = unscale**-1
-        if self.scale_attn_weights:
-            scale_factor /= self.head_dim**0.5
-
-        # MQA models: (batch_size, query_length, num_heads * head_dim)
-        # MHA models: (batch_size, num_heads, query_length, head_dim)
-        query_shape = query.shape
-        batch_size = query_shape[0]
-        key_length = key.size(-2)
-
-        key = key.transpose(-1, -2)
-        if self.multi_query:
-            # (batch_size, query_length, num_heads, head_dim) x (batch_size, head_dim, key_length)
-            # -> (batch_size, query_length, num_heads, key_length)
-            query_length = query_shape[1]
-            attn_shape = (batch_size, query_length, self.num_heads, key_length)
-            attn_view = (batch_size, query_length * self.num_heads, key_length)
-            # No copy needed for MQA 2, or when layer_past is provided.
-            query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
-        else:
-            # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
-            # -> (batch_size, num_heads, query_length, key_length)
-            query_length = query_shape[2]
-            attn_shape = (batch_size, self.num_heads, query_length, key_length)
-            attn_view = (batch_size * self.num_heads, query_length, key_length)
-            # Always copies
-            query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
-            # No copy when layer_past is provided.
-            key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
-
-        attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
-        if query.device.type == "cpu":
-            # This is needed because of a bug in pytorch https://github.com/pytorch/pytorch/issues/80588.
-            # The bug was fixed in https://github.com/pytorch/pytorch/pull/96086,
-            # but the fix has not been released as of pytorch version 2.0.0.
-            attn_weights.zero_()
-            beta = 1
-        else:
-            beta = 0
-        attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
-
-        if upcast:
-            # Use a fused kernel to prevent a large overhead from casting and scaling.
-            # Sub-optimal when the key length is not a multiple of 8.
-            if attention_mask is None:
-                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
-            else:
-                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
-        else:
-            if attention_mask is not None:
-                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-
-                # The fused kernel is very slow when the key length is not a multiple of 8, so we skip fusion.
-                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
-
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-
-        attn_weights = self.attn_dropout(attn_weights)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            if self.multi_query:
-                head_mask = head_mask.transpose(1, 2)
-            attn_weights = attn_weights * head_mask
-
-        if self.multi_query:
-            attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
-        else:
-            attn_output = torch.matmul(attn_weights, value)
-
-        return attn_output, attn_weights
-
 
 class GPTBigCodeMLP(nn.Module):
     def __init__(self, intermediate_size, config):
