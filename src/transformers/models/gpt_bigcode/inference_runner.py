@@ -4,7 +4,7 @@ import torch
 
 from transformers import GPTBigCodeConfig
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from transformers.models.gpt_bigcode.configuration_gpt_bigcode import AttentionType, InferenceRunnerType
+from transformers.models.gpt_bigcode.configuration_gpt_bigcode import InferenceRunnerType
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, masked_softmax, upcast_masked_softmax
 
 
@@ -25,7 +25,7 @@ class GPTBigCodeInferenceRunner:
         self.pad_key_length = 8 if config.pad_key_length else 1
 
         # TODO: Support other attention types?
-        assert model.attention_type == AttentionType.MULTI_QUERY_1
+        assert model.multi_query
 
         self.max_sequence_length = config.max_sequence_length or config.n_positions
 
@@ -71,7 +71,7 @@ class GPTBigCodeInferenceRunner:
         for block in self.model.h:
             block.attn.freeze_kv_cache()
             kv_cache = block.attn.get_kv_cache(self.batch_size, self.max_sequence_length, self.device, self.dtype)
-            if attn.is_mqa:
+            if attn.multi_query:
                 kv_cache = kv_cache.unsqueeze(1)
             kv_caches.append(kv_cache)
 
@@ -122,7 +122,7 @@ class GPTBigCodeInferenceRunner:
         self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
         keys, values = zip(*(kv_cache.split((attn.head_dim, attn.head_dim), dim=-1) for kv_cache in kv_caches))
-        head_slice = 0 if attn.is_mqa else slice(None)
+        head_slice = 0 if attn.multi_query else slice(None)
 
         self.padded_keys = [
             [key[:, head_slice, :key_length, :].transpose(-1, -2) for key in keys] for key_length in padded_key_lengths
@@ -285,9 +285,9 @@ class GPTBigCodeInferenceRunner:
 
     def forward(
         self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.FloatTensor,
-        position_ids: torch.LongTensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
         past_key_values: Union[List[torch.Tensor], int],
     ) -> BaseModelOutputWithPastAndCrossAttentions:
         batch_size, query_length = input_ids.shape
