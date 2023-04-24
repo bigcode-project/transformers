@@ -4,8 +4,17 @@ import torch
 
 from transformers import GPTBigCodeConfig
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
-from transformers.models.gpt_bigcode.configuration_gpt_bigcode import InferenceRunnerType
-from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, masked_softmax, upcast_masked_softmax
+from transformers.models.gpt_bigcode.configuration_gpt_bigcode import (
+    AttentionImplementation,
+    InferenceRunnerType,
+)
+from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, softmax_function
+
+
+try:
+    from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+except ImportError:
+    flash_attn_unpadded_func = None
 
 
 def _align_tensor(x):
@@ -23,6 +32,7 @@ class GPTBigCodeInferenceRunner:
         assert config.pre_allocate_kv_cache
         self.validate_input = config.validate_runner_input
         self.pad_key_length = 8 if config.pad_key_length else 1
+        self.fused_softmax = True if config.fused_softmax is None and config.pad_key_length else config.fused_softmax
 
         # TODO: Support other attention types?
         assert model.multi_query
@@ -51,9 +61,10 @@ class GPTBigCodeInferenceRunner:
         query_end = query_begin + self.batch_size * attn.embed_dim
         # KV: (bs, 2 * kv_dim), combines with query into c_attn.
         kv_end = query_end + 2 * self.batch_size * attn.kv_dim
-        # Attn weights: (batch_size, num_heads, key_length), no overlap with value
+        # Attn weights: (batch_size, num_heads, key_length), no overlap with value (not needed for torch/flash attn)
         attn_weights_begin = _align_tensor(kv_end)
-        attn_weights_end = kv_end + self.batch_size * attn.num_heads * self.max_sequence_length
+        attn_weights_end = attn_weights_begin
+        attn_weights_end += self.batch_size * attn.num_heads * self.max_sequence_length
         # Projection: (batch_size, embed_dim), no overlap with attn outputs ~ query.
         # Also used for MLP projection
         c_proj_begin = _align_tensor(query_end)
@@ -119,11 +130,13 @@ class GPTBigCodeInferenceRunner:
         # QKV: (bs, embed_dim + 2 * kv_dim).
         self.c_attn = activation_pool[query_begin:kv_end].view(self.batch_size, -1)
         self.query = self.c_attn[:, : attn.embed_dim].view(self.batch_size, attn.num_heads, attn.head_dim)
+
         self.kv_attn = self.c_attn[:, attn.embed_dim :]
 
         keys, values = zip(*(kv_cache.split((attn.head_dim, attn.head_dim), dim=-1) for kv_cache in kv_caches))
         head_slice = 0 if attn.multi_query else slice(None)
 
+        # No transpose for torch/flash attn
         self.padded_keys = [
             [key[:, head_slice, :key_length, :].transpose(-1, -2) for key in keys] for key_length in padded_key_lengths
         ]
@@ -159,6 +172,10 @@ class GPTBigCodeInferenceRunner:
         if self.inference_runner_type != InferenceRunnerType.BASE_RUNNER:
             print("Generating cuda graphs")
             self.memory_pool = None
+            # This prevents some issue with cublas initialization.
+            # https://github.com/pytorch/pytorch/issues/99397
+            dummy_matrix = self.mask_value.view([1, 1])
+            torch.matmul(dummy_matrix, dummy_matrix)
             if self.inference_runner_type == InferenceRunnerType.FULL_GRAPH:
                 self.cuda_graphs = {}
                 # The output may not always be at the same memory location.
@@ -187,22 +204,19 @@ class GPTBigCodeInferenceRunner:
 
     def _generate_full_cuda_graph(self, key_length):
         # We need to warmup the jit function before creating the graph, otherwise it will crash.
+        # https://github.com/pytorch/pytorch/issues/99397
         # Warmup needs to be done for every input shape (key length), and for both scale == 1 and scale != 1
-        if self.upcast:
+        if self.fused_softmax or (self.fused_softmax is None and key_length % 8 == 0):
             for scale in (1.0, 2.0):
-                upcast_masked_softmax(
+                softmax_function(
                     self.padded_attn_weights[key_length],
                     self.padded_attn_masks[key_length],
                     self.mask_value,
                     scale,
                     self.softmax_dtype,
+                    self.upcast,
+                    self.fused_softmax,
                 )
-        else:
-            masked_softmax(
-                self.padded_attn_weights[key_length],
-                self.padded_attn_masks[key_length],
-                self.mask_value,
-            )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.memory_pool):
             self.output_hidden_states[key_length] = self._forward(key_length)
@@ -239,18 +253,16 @@ class GPTBigCodeInferenceRunner:
             alpha=self.scale[layer_idx],
             out=attn_weights,
         )
-        # Use a fused kernel to prevent a large overhead from casting and scaling.
         # Jit doesn't allow inplace kernel.
-        if self.upcast:
-            attn_weights = upcast_masked_softmax(
-                attn_weights,
-                self.padded_attn_masks[key_length],
-                self.mask_value,
-                self.unscale[layer_idx],
-                self.softmax_dtype,
-            )
-        else:
-            attn_weights = masked_softmax(attn_weights, self.padded_attn_masks[key_length], self.mask_value)
+        attn_weights = softmax_function(
+            attn_weights,
+            self.padded_attn_masks[key_length],
+            self.mask_value,
+            self.unscale[layer_idx],
+            self.softmax_dtype,
+            self.upcast,
+            self.fused_softmax,
+        )
 
         torch.bmm(attn_weights, self.padded_values[key_length][layer_idx], out=self.attn_output_expanded)
 
