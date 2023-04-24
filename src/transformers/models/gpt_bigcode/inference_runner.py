@@ -5,7 +5,6 @@ import torch
 from transformers import GPTBigCodeConfig
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
 from transformers.models.gpt_bigcode.configuration_gpt_bigcode import (
-    AttentionImplementation,
     InferenceRunnerType,
 )
 from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeBlock, softmax_function

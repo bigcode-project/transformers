@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch GPTBigCode model."""
-import contextlib
 import math
 from typing import List, Optional, Tuple, Union
 
@@ -181,8 +180,6 @@ class GPTBigCodeAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
-
-
         if self.flash_attention:
             if flash_attn_unpadded_func is None:
                 raise RuntimeError(
@@ -348,7 +345,7 @@ class GPTBigCodeAttention(nn.Module):
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
     ]:
-        flash_attention=self.flash_attention and not layer_past
+        flash_attention = self.flash_attention and not layer_past
         if self.multi_query or flash_attention:
             query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
         else:
@@ -370,9 +367,9 @@ class GPTBigCodeAttention(nn.Module):
             _, padding_index, batch_size, max_sequence_length = attention_mask
             kv_cache = pad_input(key_value, padding_index, batch_size, max_sequence_length)
             if not self.multi_query:
-                kv_cache=kv_cache.view(*hidden_states.shape[:2], self.num_heads, 2 * self.head_dim).transpose(1, 2)
+                kv_cache = kv_cache.view(*hidden_states.shape[:2], self.num_heads, 2 * self.head_dim).transpose(1, 2)
         else:
-            kv_cache=key_value
+            kv_cache = key_value
         if self.pre_allocate_kv_cache:
             if use_cache or layer_past is not None:
                 last_key_length = layer_past or 0
@@ -389,16 +386,18 @@ class GPTBigCodeAttention(nn.Module):
                 present = key_length if use_cache else None
                 if not flash_attention:
                     # Not needed when layer_past is None but frees some memory.
-                    key_value=kv_cache_
+                    key_value = kv_cache_
         else:
             if layer_past is not None:
                 kv_cache = torch.cat((layer_past, key_value), dim=-2)
-                key_value=kv_cache
+                key_value = kv_cache
             present = kv_cache if use_cache else None
 
         key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
-        attn_output, attn_weights = (self._attn_flash if flash_attention else self._attn)(query, key, value, attention_mask, head_mask)
+        attn_output, attn_weights = (self._attn_flash if flash_attention else self._attn)(
+            query, key, value, attention_mask, head_mask
+        )
 
         if not self.multi_query:
             attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
@@ -420,7 +419,7 @@ class GPTBigCodeAttention(nn.Module):
         if head_mask is not None:
             raise NotImplementedError("Head mask is not supported with flash attention.")
 
-        query_shape=query.shape
+        query_shape = query.shape
         attn_shape = query_shape[0], self.num_heads, self.head_dim
         query = query.view(attn_shape)
         if self.multi_query:
@@ -448,7 +447,6 @@ class GPTBigCodeAttention(nn.Module):
 
         return attn_output, None
 
-
     def _attn(self, query, key, value, attention_mask, head_mask=None):
         dtype = query.dtype
         softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
@@ -465,7 +463,7 @@ class GPTBigCodeAttention(nn.Module):
         batch_size = query_shape[0]
         key_length = key.size(-2)
 
-        key=key.transpose(-1, -2)
+        key = key.transpose(-1, -2)
         if self.multi_query:
             # (batch_size, query_length, num_heads, head_dim) x (batch_size, head_dim, key_length)
             # -> (batch_size, query_length, num_heads, key_length)
