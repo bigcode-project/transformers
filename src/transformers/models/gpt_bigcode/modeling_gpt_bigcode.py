@@ -244,22 +244,15 @@ class GPTBigCodeAttention(nn.Module):
             beta = 0
         attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
 
-        if upcast:
-            # Use a fused kernel to prevent a large overhead from casting and scaling.
-            # Sub-optimal when the key length is not a multiple of 8.
-            if attention_mask is None:
-                attn_weights = upcast_softmax(attn_weights, unscale, softmax_dtype)
-            else:
-                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-                attn_weights = upcast_masked_softmax(attn_weights, attention_mask, mask_value, unscale, softmax_dtype)
-        else:
-            if attention_mask is not None:
-                mask_value = self._get_mask_value(attn_weights.device, softmax_dtype)
-
-                # The fused kernel is very slow when the key length is not a multiple of 8, so we skip fusion.
-                attn_weights = torch.where(attention_mask, attn_weights, mask_value)
-
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = softmax_function(
+            attn_weights,
+            attention_mask,
+            None if attention_mask is None else self._get_mask_value(attn_weights.device, softmax_dtype),
+            unscale,
+            softmax_dtype,
+            upcast,
+            self.fused_softmax,
+        )
 
         attn_weights = self.attn_dropout(attn_weights)
 
@@ -359,36 +352,37 @@ class GPTBigCodeAttention(nn.Module):
             key_length = query_length + last_key_length
             allocated_key_length = allocated_kv_cache.size(self.seq_dim)
 
-
         padded_key_length = key_length if flash_attention else attention_mask.size(-1)
         allocate_key_length = padded_key_length if use_cache else max(self.pre_allocate_kv_cache, padded_key_length)
-        print("A", key_length, padded_key_length, allocate_key_length,allocate_key_length)#, attention_mask.shape)
 
         # Re-allocate kv cache and copy last value
         if allocate_key_length > allocated_key_length:
-            print(f"Allocate {allocate_key_length}")
             if self.multi_query:
                 allocated_kv_cache = torch.empty(
-                    [batch_size, allocate_key_length, 2*self.head_dim],
+                    [batch_size, allocate_key_length, 2 * self.head_dim],
                     dtype=current_kv_cache.dtype,
                     device=current_kv_cache.device,
                 )
-                print(f"Copy 0:{last_key_length}")
                 if layer_past is not None:
                     allocated_kv_cache[:, :last_key_length].copy_(last_kv_cache)
+                if allocate_key_length > key_length:
+                    # Nans in `value` can propagate through the matrix multiplication,
+                    # so we set the remaining values to zero. (`last_key_length:key_length` is set below.)
+                    allocated_kv_cache[:, key_length:, self.head_dim :].zero_()
             else:
                 allocated_kv_cache = torch.empty(
-                    [batch_size, self.num_heads, allocate_key_length, 2*self.head_dim],
+                    [batch_size, self.num_heads, allocate_key_length, 2 * self.head_dim],
                     dtype=current_kv_cache.dtype,
                     device=current_kv_cache.device,
                 )
                 if layer_past is not None:
                     allocated_kv_cache[:, :, :last_key_length].copy_(last_kv_cache)
+                if allocate_key_length > key_length:
+                    allocated_kv_cache[:, :, key_length:, self.head_dim :].zero_()
 
         # Copy the new values.
         if allocate_key_length > allocated_key_length or layer_past is not None:
             if self.multi_query:
-                print(f"Copy {last_key_length}:{key_length}")
                 allocated_kv_cache[:, last_key_length:key_length].copy_(current_kv_cache)
                 padded_kv_cache = allocated_kv_cache[:, :padded_key_length]
             else:
@@ -398,7 +392,6 @@ class GPTBigCodeAttention(nn.Module):
                 # Use the merged KV cache.
                 # Not needed when layer_past is None but frees some memory.
                 key_value = padded_kv_cache
-        #print("B", key_value.shape, allocated_kv_cache.shape)#, padded_kv_cache.shape
 
         if use_cache:
             if allocated_kv_cache is None:
