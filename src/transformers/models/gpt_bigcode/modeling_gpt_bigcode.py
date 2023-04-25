@@ -166,8 +166,8 @@ class GPTBigCodeAttention(nn.Module):
         self.pre_allocate_kv_cache = (
             config.n_embd if config.pre_allocate_kv_cache is True else config.pre_allocate_kv_cache
         )
-        self.pad_key_length = config.pre_allocate_kv_cache if config.pad_key_length is None else config.pad_key_length
-        self._tuple_cache_format = self.pre_allocate_kv_cache or self.pad_key_length or self.flash_attention
+        pad_key_length = config.pre_allocate_kv_cache if config.pad_key_length is None else config.pad_key_length
+        self._tuple_cache_format = self.pre_allocate_kv_cache or pad_key_length or self.flash_attention
 
         if self.is_cross_attention:
             raise NotImplementedError("Cross-attention is not supported for gpt_bigcode.")
@@ -328,7 +328,7 @@ class GPTBigCodeAttention(nn.Module):
         return allocated_kv_cache, padded_kv_cache
 
     def _merge_kv_caches(self, key_value, use_cache, layer_past, attention_mask):
-        flash_attention = self.flash_attention and not layer_past
+        flash_attention = self.flash_attention and layer_past is None
 
         # Convert to standard KV cache format.
         if flash_attention and use_cache:
@@ -359,22 +359,26 @@ class GPTBigCodeAttention(nn.Module):
             key_length = query_length + last_key_length
             allocated_key_length = allocated_kv_cache.size(self.seq_dim)
 
-        padded_key_length = key_length if flash_attention else attention_mask.size(self.seq_dim)
+
+        padded_key_length = key_length if flash_attention else attention_mask.size(-1)
         allocate_key_length = padded_key_length if use_cache else max(self.pre_allocate_kv_cache, padded_key_length)
+        print("A", key_length, padded_key_length, allocate_key_length,allocate_key_length)#, attention_mask.shape)
 
         # Re-allocate kv cache and copy last value
         if allocate_key_length > allocated_key_length:
+            print(f"Allocate {allocate_key_length}")
             if self.multi_query:
                 allocated_kv_cache = torch.empty(
-                    [batch_size, allocate_key_length, self.head_dim],
+                    [batch_size, allocate_key_length, 2*self.head_dim],
                     dtype=current_kv_cache.dtype,
                     device=current_kv_cache.device,
                 )
+                print(f"Copy 0:{last_key_length}")
                 if layer_past is not None:
                     allocated_kv_cache[:, :last_key_length].copy_(last_kv_cache)
             else:
                 allocated_kv_cache = torch.empty(
-                    [batch_size, self.num_heads, allocate_key_length, self.head_dim],
+                    [batch_size, self.num_heads, allocate_key_length, 2*self.head_dim],
                     dtype=current_kv_cache.dtype,
                     device=current_kv_cache.device,
                 )
@@ -384,6 +388,7 @@ class GPTBigCodeAttention(nn.Module):
         # Copy the new values.
         if allocate_key_length > allocated_key_length or layer_past is not None:
             if self.multi_query:
+                print(f"Copy {last_key_length}:{key_length}")
                 allocated_kv_cache[:, last_key_length:key_length].copy_(current_kv_cache)
                 padded_kv_cache = allocated_kv_cache[:, :padded_key_length]
             else:
@@ -393,6 +398,7 @@ class GPTBigCodeAttention(nn.Module):
                 # Use the merged KV cache.
                 # Not needed when layer_past is None but frees some memory.
                 key_value = padded_kv_cache
+        #print("B", key_value.shape, allocated_kv_cache.shape)#, padded_kv_cache.shape
 
         if use_cache:
             if allocated_kv_cache is None:
@@ -414,9 +420,9 @@ class GPTBigCodeAttention(nn.Module):
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
     ]:
-        flash_attention = self.flash_attention and not layer_past
+        flash_attention = self.flash_attention and layer_past is None
         if self.multi_query or flash_attention:
-            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=-1)
         else:
             # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
             # i.e., the memory layout is not the same as GPT2.
@@ -818,6 +824,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         if batch_size <= 0:
             raise ValueError("batch_size has to be defined and > 0")
 
+        flash_attention = self.flash_attention and past_key_values is None
         if past_key_values is None:
             past_length = 0
             past_key_values = tuple([None] * len(self.h))
@@ -832,7 +839,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, query_length)
 
-        if not self.flash_attention:
+        if not flash_attention:
             # Self-attention mask (padding + causal).
             attention_mask = self._get_causal_mask(attention_mask, query_length, key_length)
             if self.pad_key_length:
@@ -861,7 +868,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         hidden_states = self.drop(hidden_states)
 
         # TODO: Unpad earlier (input ids), support unpadded input?
-        if self.flash_attention:
+        if flash_attention:
             hidden_states, padding_index, sequence_lengths, max_sequence_length = unpad_input(
                 hidden_states, attention_mask
             )
@@ -913,7 +920,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         hidden_states = self.ln_f(hidden_states)
 
-        if self.flash_attention:
+        if flash_attention:
             hidden_states = pad_input(hidden_states, padding_index, batch_size, query_length)
 
         hidden_states = hidden_states.view(input_shape + (hidden_states.size(-1),))
