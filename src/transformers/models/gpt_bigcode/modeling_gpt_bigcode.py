@@ -187,9 +187,6 @@ class GPTBigCodeAttention(nn.Module):
             if not self.multi_query:
                 # TODO: Flash Attention is implemented but not tested for MHA
                 raise ValueError("Flash Attention is not supported with multi-head attention.")
-            if self.pre_allocate_kv_cache:
-                raise ValueError("KV cache pre-allocation is not supported with Flash Attention")
-            assert not self.pre_allocate_kv_cache
 
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
