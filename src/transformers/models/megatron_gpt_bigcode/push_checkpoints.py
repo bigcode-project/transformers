@@ -61,12 +61,21 @@ def main(argv=None):
         if iter_number <= last_commit_iter:
             continue
         if iter_number % args.iter_interval == 0:
-            print(f"Converting iteration {iter_number}")
+            print(f"Converting iteration {iter_number} and pushing with commit {ckpt_dir.name}")
             # TODO: this only works for 1-way tensor/pipeline parallelism
             file_path = next((ckpt_dir / "mp_rank_00").glob("*.pt"))
             convert(argv + [f"--save_dir={str(save_dir)}", str(file_path)])
-            print(f"Pushing iteration {iter_number}")
-            hf_repo.push_to_hub(commit_message=f"{ckpt_dir.name}")
+            print("Load with transformers")
+            from transformers import AutoModelForCausalLM
+
+            model = AutoModelForCausalLM.from_pretrained(save_dir)
+            print("Model loaded and is being sharded and save to disk")
+            model.save_pretrained(PUSH_DIR)
+            print("Adding tokenizer files")
+            copy_tokenizer_files(save_dir)
+            print(f"Local copy saved at {PUSH_DIR}, now pushing:")
+            # usually fails
+            model.push_to_hub("bigcode/starcommitter", commit_message=f"{ckpt_dir.name}")
 
 
 if __name__ == "__main__":
