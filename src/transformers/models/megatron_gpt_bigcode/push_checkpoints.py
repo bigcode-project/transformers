@@ -70,10 +70,10 @@ def main(argv=None):
 
             model = AutoModelForCausalLM.from_pretrained(save_dir)
             print("Model loaded and is being sharded and save to disk")
-            model.save_pretrained(PUSH_DIR)
+            model.save_pretrained(save_dir)
             print("Adding tokenizer files")
-            copy_tokenizer_files(save_dir)
-            print(f"Local copy saved at {PUSH_DIR}, now pushing:")
+            # copy_tokenizer_files(save_dir)
+            print(f"Local copy saved at {save_dir}, now pushing:")
             # usually fails
             model.push_to_hub("bigcode/starcommitter", commit_message=f"{ckpt_dir.name}")
 
