@@ -123,7 +123,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         use_rotary_embeddings=False,
         rotary_embedding_scale=-math.log(10000), # - 9.210
         use_position_embeddings=None,
-        # TODO: add window
+        attention_window_size=None,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -146,6 +146,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.use_rotary_embeddings = use_rotary_embeddings
         self.rotary_embedding_scale = rotary_embedding_scale
         self.use_position_embeddings = use_position_embeddings if use_position_embeddings is not None else not use_rotary_embeddings
+        self.attention_window_size = attention_window_size
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
