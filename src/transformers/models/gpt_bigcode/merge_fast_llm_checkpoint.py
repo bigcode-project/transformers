@@ -39,6 +39,21 @@ def extract_individual_weights(merged_stage_shard, stage_content):
     return [weight.reshape(weight_meta['shape']) for weight, weight_meta in zip(weights, stage_content)]
 
 
+def concatenate_tp_shards(stage_tp_shards, stage_content):
+    # Concatenate the tp-shards in a given stage
+    # Stage_tp_shards: contains the individual weight shards for each rank
+    # [[weight1, weight2, ...] for rank in range(tp_size)]
+    concatenated_weights = []
+    # Concatenate each individual weight along their TP dimension if they have one.
+    for weight_tp_shards, weight_meta in zip(zip(*stage_tp_shards), stage_content):
+        if weight_meta["tensor_parallel_dim"] is not None:
+            weight = torch.cat(weight_tp_shards, dim=weight_meta["tensor_parallel_dim"])
+        else:
+            weight = weight_tp_shards[0]
+        concatenated_weights.append(weight)
+    return concatenated_weights
+
+
 def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
     """Load a fast-llm checkpoint and merge the data, tensor, and pipeline-parallel shards"""
     checkpoint_paths = get_checkpoint_paths(experiment_dir)
@@ -51,7 +66,8 @@ def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
         for c_name in tqdm(checkpoint_paths[-1])
     }
     num_stages = len(states[0]["stages"])
-    data_parallel_size = int(config["world_size"] / (config["tensor_parallel"] * config["pipeline_parallel"]))
+    tensor_parallel = config["tensor_parallel"]
+    data_parallel_size = int(config["world_size"] / (tensor_parallel * config["pipeline_parallel"]))
 
     if dummy_experiment_dir is not None:
         # Use the meta from the dummy checkpoint, and the shard from the actual checkpoint
@@ -69,7 +85,7 @@ def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
     # {tp_rank: [{fsdp_rank: shard}, ...]}
     fsdp_shards = {
         i: [[None for _ in range(data_parallel_size)] for _ in range(num_stages)]
-        for i in range(config["tensor_parallel"])
+        for i in range(tensor_parallel)
     }
     
     for rank, state in states.items():
@@ -82,7 +98,7 @@ def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
     
     # Concatenate the data-parallel shards
     # and get individual weights
-    data_concatenated_shards = {
+    dp_concatenated_shards = {
         tp_rank: [
             extract_individual_weights(
                 torch.cat(stage_shards, dim=0),
@@ -94,8 +110,10 @@ def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
     }
 
     # In the tensor-parallel case, concatenate the TP tensors along their TP dimensions.
-    # TODO
-    tp_concatenated_shards = data_concatenated_shards[0]
+    tp_concatenated_shards = []
+    for stage_index, stage_tp_shards in enumerate(zip(*(dp_concatenated_shards[i] for i in range(tensor_parallel)))):
+        stage_content = states[0]["stages"][stage_index]["content"]
+        tp_concatenated_shards.append(concatenate_tp_shards(stage_tp_shards, stage_content))
 
     # In the pipeline-parallel case, merge the stages
     state_dict = {
