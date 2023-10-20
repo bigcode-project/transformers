@@ -94,30 +94,29 @@ def convert_fast_llm_checkpoint(state_dict, config):
     return output_state_dict, config
 
 
-
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--experiment_dir",
+        "--checkpoint_dir",
         type=str,
         help="Path to the experiment directory",
-        default="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/1B_repo_context_Top-level-Depth-first_pp2_64k_64k_2023_10_17_16_35_27/"  # TODO
     )
     parser.add_argument(
-        "--save_dir", help="Path where the converted model is saved. Will use the checkpoint directory if not provided",
-        default="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/1B_repo_context_Top-level-Depth-first_pp2_64k_64k_2023_10_17_16_35_27/converted"  # TODO
+        "--save_dir",
+        type=str,
+        help="Path where the converted model is saved"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     state_dict, config = merge_checkpoint(
-        args.experiment_dir,
-        dummy_experiment_dir="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/dev_1B_repo_context_Random_pp2_64k_64k_2023_10_18_22_20_36/"
+        args.checkpoint_dir,
+        dummy_experiment_dir="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/dev_1B_repo_context_Random_tp4_pp2_8k_8k_2023_10_19_18_40_11/"
     )
     
     output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
     
     print("Saving config")
-    save_dir = args.save_dir or os.path.dirname(args.experiment_dir)
+    save_dir = args.save_dir or args.checkpoint_dir + "-converted"
     output_config.save_pretrained(save_dir)
 
     # Store the state_dict to file.
@@ -125,3 +124,7 @@ if __name__ == '__main__':
     print(f'Saving checkpoint to "{output_checkpoint_file}"')
     torch.save(output_state_dict, output_checkpoint_file)
     print(f'Done!')
+
+
+if __name__ == "__main__":
+    main()

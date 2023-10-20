@@ -7,14 +7,15 @@ import torch
 import yaml
 
 
-def get_checkpoint_paths(experiment_path):
+def get_all_checkpoint_paths(experiment_path):
     checkpoints = (Path(experiment_path) / "checkpoints").glob("*")
     # Sort checkpoints by iteration number
     checkpoints = sorted(checkpoints, key=lambda x: int(x.name))
-    return [
-        [c_name for c_name in checkpoint.glob("*") if re.match(r"\d+", c_name.name)]
-        for checkpoint in checkpoints
-    ]
+    return [get_checkpoint_paths(checkpoint) for checkpoint in checkpoints]
+
+
+def get_checkpoint_paths(checkpoint_dir: Path):
+    return [c_name for c_name in checkpoint_dir.glob("*") if re.match(r"\d+", c_name.name)]
 
 
 def extract_stage_shards(state):
@@ -54,16 +55,18 @@ def concatenate_tp_shards(stage_tp_shards, stage_content):
     return concatenated_weights
 
 
-def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
+def merge_checkpoint(checkpoint_dir, dummy_experiment_dir=None):
     """Load a fast-llm checkpoint and merge the data, tensor, and pipeline-parallel shards"""
-    checkpoint_paths = get_checkpoint_paths(experiment_dir)
+    # checkpoint_dir=experiment_dir/checkpoints/{iteration}
+    checkpoint_dir = Path(checkpoint_dir)
+    experiment_dir = checkpoint_dir.parent.parent
+    checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
     config = yaml.safe_load((Path(experiment_dir) / "config.yaml").read_text())
 
-    # Convert the last iteration
     # Load the states from all the ranks
     states = {
         int(c_name.name): torch.load(c_name)
-        for c_name in tqdm(checkpoint_paths[-1])
+        for c_name in tqdm(checkpoint_paths)
     }
     num_stages = len(states[0]["stages"])
     tensor_parallel = config["tensor_parallel"]
@@ -71,7 +74,7 @@ def merge_checkpoint(experiment_dir, dummy_experiment_dir=None):
 
     if dummy_experiment_dir is not None:
         # Use the meta from the dummy checkpoint, and the shard from the actual checkpoint
-        dummy_checkpoint_paths = get_checkpoint_paths(dummy_experiment_dir)
+        dummy_checkpoint_paths = get_all_checkpoint_paths(dummy_experiment_dir)
         dummy_states = {
             int(c_name.name): torch.load(c_name)
             for c_name in tqdm(dummy_checkpoint_paths[-1])
