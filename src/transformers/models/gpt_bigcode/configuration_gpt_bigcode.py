@@ -14,6 +14,7 @@
 # limitations under the License.
 """ GPTBigCode configuration"""
 
+import math
 from ...configuration_utils import PretrainedConfig
 from ...utils import logging
 
@@ -119,6 +120,10 @@ class GPTBigCodeConfig(PretrainedConfig):
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         multi_query=True,
+        use_rotary_embeddings=False,
+        rotary_embedding_scale=-math.log(10000), # - 9.210
+        use_position_embeddings=None,
+        # TODO: add window
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -138,6 +143,9 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.attention_softmax_in_fp32 = attention_softmax_in_fp32
         self.scale_attention_softmax_in_fp32 = scale_attention_softmax_in_fp32
         self.multi_query = multi_query
+        self.use_rotary_embeddings = use_rotary_embeddings
+        self.rotary_embedding_scale = rotary_embedding_scale
+        self.use_position_embeddings = use_position_embeddings if use_position_embeddings is not None else not use_rotary_embeddings
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id

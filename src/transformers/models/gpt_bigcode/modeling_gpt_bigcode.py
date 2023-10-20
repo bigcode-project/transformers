@@ -78,6 +78,22 @@ def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor
     return x
 
 
+@torch.compile
+def _apply_rotary_embeddings(
+    tensor: torch.Tensor,
+    rope_frequencies: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to a tensor:
+    * Convert it to a complex, full-precision tensor
+    * Multiply by the frequencies
+    * Convert back tho the input format.
+    # TODO: Full precision only needed for bfloat16? (Doesn't support complex numbers)
+    """
+    complex_tensor = torch.view_as_complex(tensor.float().view(*tensor.shape[:-1], -1, rope_frequencies.size(-1), 2))
+    return torch.view_as_real(complex_tensor * rope_frequencies).view_as(tensor).type_as(tensor)
+
+
 class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
@@ -212,6 +228,7 @@ class GPTBigCodeAttention(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
+        rotary_embedding_frequencies: Optional[torch.Tensor] = None
     ) -> Union[
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
@@ -244,6 +261,11 @@ class GPTBigCodeAttention(nn.Module):
         present = key_value if use_cache else None
 
         key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
+
+        if self.config.use_rotary_embeddings:
+            # TODO: check/fix
+            query = _apply_rotary_embeddings(query, rotary_embedding_frequencies)
+            key = _apply_rotary_embeddings(key, rotary_embedding_frequencies)
 
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
@@ -308,6 +330,7 @@ class GPTBigCodeBlock(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
+        rotary_embedding_frequencies: Optional[torch.Tensor] = None
     ) -> Union[
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
@@ -320,6 +343,7 @@ class GPTBigCodeBlock(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            rotary_embedding_frequencies=rotary_embedding_frequencies
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -342,6 +366,7 @@ class GPTBigCodeBlock(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
+                rotary_embedding_frequencies=rotary_embedding_frequencies
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -506,7 +531,22 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.embed_dim = config.hidden_size
 
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        if config.use_position_embeddings:
+            self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        if config.use_rotary_embeddings:
+            # Calculate the complex frequencies (https://blog.eleuther.ai/rotary-embeddings/)
+            # `exp(i * n * a) = cos(n * a) + i sin(n * a)`,
+            # `a = theta ** - (2 * (channel // 2) / kv_channels)`,
+            # where n is the position in the sequence.
+            kv_channels = config.n_embd / config.n_head
+            angles = torch.outer(
+                torch.arange(config.max_position_embeddings, dtype=torch.float32),
+                torch.exp(
+                    config.rotary_embedding_scale
+                    * torch.arange(0, 1, 2 / kv_channels, dtype=torch.float32)
+                ),
+            )
+            self._rotary_embedding_frequencies = torch.polar(torch.ones_like(angles), angles)[None, :, None, :]
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
@@ -632,8 +672,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        if self.config.use_position_embeddings:
+            position_embeds = self.wpe(position_ids)
+            hidden_states = inputs_embeds + position_embeds
+        else:
+            hidden_states = inputs_embeds
 
         if token_type_ids is not None:
             token_type_embeds = self.wte(token_type_ids)
@@ -656,7 +699,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, use_cache, output_attentions)
+                        return module(*inputs, use_cache, output_attentions, self._rotary_embedding_frequencies)
 
                     return custom_forward
 
@@ -679,6 +722,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    rotary_embedding_frequencies=self._rotary_embedding_frequencies
                 )
 
             hidden_states = outputs[0]
