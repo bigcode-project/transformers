@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 import torch
-from merge_fast_llm_checkpoint import merge_checkpoint
+from transformers.models.gpt_bigcode.merge_fast_llm_checkpoint import merge_checkpoint
 from transformers.models.gpt_bigcode import GPTBigCodeConfig, GPTBigCodeForCausalLM, GPTBigCodeModel
 
 
@@ -53,14 +53,15 @@ def convert_fast_llm_checkpoint(state_dict, config):
         use_rotary_embeddings=config["use_rotary_embeddings"],
         rotary_embedding_scale=config["rotary_embedding_scale"],
         use_position_embeddings=config["use_position_embeddings"],
+        attention_window_size=config["attention_window_size"]
     )
 
     # Truncate the word embeddings to the vocab-size
     word_embeddings = state_dict.pop("_layers.0._word_embeddings_weight")[:config.vocab_size, :]
     output_state_dict["transformer.wte.weight"] = word_embeddings
     # TODO: positional embeddings
-    # Layers
-    # 
+    # Layer-0 is the word embeddings
+    # Layers 1 to n_layer need to be re-mapped from 0 to n_layer-1.
     # _layers.{layer_index}.{op}.{w/b}
 
     # Concatenate QKV matrix

@@ -648,6 +648,9 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         query_length = input_shape[-1]
         key_length = past_length + query_length
         self_attention_mask = self.bias[None, key_length - query_length : key_length, :key_length]
+        # Sliding window attention
+        if self.config.attention_window_size is not None:
+            self_attention_mask.triu_(-self.config.attention_window_size + 1)
 
         if attention_mask is not None:
             self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
