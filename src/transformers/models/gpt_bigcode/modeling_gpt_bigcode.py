@@ -111,6 +111,7 @@ class GPTBigCodeAttention(nn.Module):
                 f"`embed_dim` must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
                 f" {self.num_heads})."
             )
+        self.use_rotary_embeddings = config.use_rotary_embeddings
 
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
@@ -262,7 +263,7 @@ class GPTBigCodeAttention(nn.Module):
 
         key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
-        if self.config.use_rotary_embeddings:
+        if self.use_rotary_embeddings:
             # TODO: check/fix
             query = _apply_rotary_embeddings(query, rotary_embedding_frequencies)
             key = _apply_rotary_embeddings(key, rotary_embedding_frequencies)
