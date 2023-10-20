@@ -78,7 +78,6 @@ def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor
     return x
 
 
-@torch.jit.script
 def _apply_rotary_embeddings(
     tensor: torch.Tensor,
     rope_frequencies: torch.Tensor,
