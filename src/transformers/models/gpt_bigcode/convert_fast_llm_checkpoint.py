@@ -1,5 +1,6 @@
 import argparse
 import os
+from pathlib import Path
 import re
 
 import torch
@@ -98,12 +99,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint_dir",
-        type=str,
+        type=Path,
         help="Path to the experiment directory",
     )
     parser.add_argument(
         "--save_dir",
-        type=str,
+        type=Path,
         help="Path where the converted model is saved"
     )
     args = parser.parse_args(argv)
@@ -116,7 +117,7 @@ def main(argv=None):
     output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
     
     print("Saving config")
-    save_dir = args.save_dir or args.checkpoint_dir + "-converted"
+    save_dir = args.save_dir or args.checkpoint_dir / "converted"
     output_config.save_pretrained(save_dir)
 
     # Store the state_dict to file.

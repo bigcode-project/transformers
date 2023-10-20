@@ -55,13 +55,12 @@ def concatenate_tp_shards(stage_tp_shards, stage_content):
     return concatenated_weights
 
 
-def merge_checkpoint(checkpoint_dir, dummy_experiment_dir=None):
+def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     """Load a fast-llm checkpoint and merge the data, tensor, and pipeline-parallel shards"""
     # checkpoint_dir=experiment_dir/checkpoints/{iteration}
-    checkpoint_dir = Path(checkpoint_dir)
     experiment_dir = checkpoint_dir.parent.parent
     checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
-    config = yaml.safe_load((Path(experiment_dir) / "config.yaml").read_text())
+    config = yaml.safe_load((experiment_dir / "config.yaml").read_text())
 
     # Load the states from all the ranks
     states = {
