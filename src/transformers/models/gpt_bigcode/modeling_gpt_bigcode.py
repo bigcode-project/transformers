@@ -229,7 +229,8 @@ class GPTBigCodeAttention(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-        rotary_embedding_frequencies: Optional[torch.Tensor] = None
+        rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
+        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None
     ) -> Union[
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
@@ -264,9 +265,8 @@ class GPTBigCodeAttention(nn.Module):
         key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
 
         if self.use_rotary_embeddings:
-            # TODO: check/fix
-            query = _apply_rotary_embeddings(query, rotary_embedding_frequencies)
-            key = _apply_rotary_embeddings(key, rotary_embedding_frequencies)
+            query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
+            key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
 
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
@@ -331,7 +331,8 @@ class GPTBigCodeBlock(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-        rotary_embedding_frequencies: Optional[torch.Tensor] = None
+        rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
+        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None
     ) -> Union[
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
@@ -344,7 +345,8 @@ class GPTBigCodeBlock(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            rotary_embedding_frequencies=rotary_embedding_frequencies
+            rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
+            rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -367,7 +369,8 @@ class GPTBigCodeBlock(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
-                rotary_embedding_frequencies=rotary_embedding_frequencies
+                rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
+                rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -636,6 +639,10 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         elif position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+        
+        # Rotary frequencies
+        rotary_embedding_frequencies_q = self._rotary_embedding_frequencies[:, past_length : past_length + input_shape[-1]]
+        rotary_embedding_frequencies_k = self._rotary_embedding_frequencies[:, :past_length + input_shape[-1], :, :]
 
         # Self-attention mask.
         query_length = input_shape[-1]
@@ -700,7 +707,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, use_cache, output_attentions, self._rotary_embedding_frequencies)
+                        return module(*inputs, use_cache, output_attentions, rotary_embedding_frequencies_q, rotary_embedding_frequencies_k)
 
                     return custom_forward
 
@@ -723,7 +730,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
-                    rotary_embedding_frequencies=self._rotary_embedding_frequencies
+                    rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
+                    rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
                 )
 
             hidden_states = outputs[0]
