@@ -82,7 +82,7 @@ def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor
 def _apply_rotary_embeddings(
     tensor: torch.Tensor,
     rope_frequencies: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to a tensor:
     * Convert it to a complex, full-precision tensor
