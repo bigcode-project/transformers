@@ -640,8 +640,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
         
         # Rotary frequencies
-        rotary_embedding_frequencies_q = self._rotary_embedding_frequencies[:, past_length : past_length + input_shape[-1]].to(device=device)
-        rotary_embedding_frequencies_k = self._rotary_embedding_frequencies[:, :past_length + input_shape[-1], :, :].to(device=device)
+        rotary_embedding_frequencies_q = None
+        rotary_embedding_frequencies_k = None
+        if self.config.use_rotary_embeddings:
+            rotary_embedding_frequencies_q = self._rotary_embedding_frequencies[:, past_length : past_length + input_shape[-1]].to(device=device)
+            rotary_embedding_frequencies_k = self._rotary_embedding_frequencies[:, :past_length + input_shape[-1], :, :].to(device=device)
 
         # Self-attention mask.
         query_length = input_shape[-1]
