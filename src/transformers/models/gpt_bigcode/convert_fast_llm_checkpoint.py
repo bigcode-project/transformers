@@ -23,6 +23,10 @@ NAME_MAP = {
 def convert_fast_llm_checkpoint(state_dict, config):
     # The converted output model.
     output_state_dict = {}
+    if "window_size" in config:
+        attention_window_size = config["window_size"]
+    else:
+        attention_window_size = config.get("attention_window_size", None)
 
     config = GPTBigCodeConfig(
         architectures=["GPTBigCodeLMHeadModel"],
@@ -46,21 +50,23 @@ def convert_fast_llm_checkpoint(state_dict, config):
         summary_first_dropout=0.1,
         scale_attn_weights=True,
         use_cache=True,
-        bos_token_id=50256,  # TODO: can we remove these?
-        eos_token_id=50256,
+        bos_token_id=0,  # TODO: can we remove these?
+        eos_token_id=0,
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         use_rotary_embeddings=config["use_rotary_embeddings"],
         rotary_embedding_scale=config["rotary_embedding_scale"],
         use_position_embeddings=config["use_position_embeddings"],
-        attention_window_size=config["attention_window_size"]
+        attention_window_size=attention_window_size
     )
 
     # Truncate the word embeddings to the vocab-size
     word_embeddings = state_dict.pop("_layers.0._word_embeddings_weight")[:config.vocab_size, :]
     output_state_dict["transformer.wte.weight"] = word_embeddings
-    # TODO: positional embeddings
-    # Layer-0 is the word embeddings
+    if config.use_position_embeddings:
+        output_state_dict["transformer.wpe.weight"] = state_dict.pop("_layers.0._position_embeddings_weight")
+
+    # Layer-0 is the word/position embeddings
     # Layers 1 to n_layer need to be re-mapped from 0 to n_layer-1.
     # _layers.{layer_index}.{op}.{w/b}
 
@@ -75,6 +81,7 @@ def convert_fast_llm_checkpoint(state_dict, config):
     layer_re = re.compile("_layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
     for name, value in state_dict.items():
         m = layer_re.match(name)
+        assert m is not None, f"Invalid layer name: {name}"
 
         # The index of the layer.
         layer_index = int(m.group(1))
@@ -112,7 +119,7 @@ def main(argv=None):
 
     state_dict, config = merge_checkpoint(
         args.checkpoint_dir,
-        dummy_experiment_dir="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/dev_1B_repo_context_Random_tp4_pp2_8k_8k_2023_10_19_18_40_11/"
+        dummy_experiment_dir=None
     )
     
     output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
