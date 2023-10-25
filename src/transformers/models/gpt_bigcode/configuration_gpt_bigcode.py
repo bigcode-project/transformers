@@ -14,6 +14,8 @@
 # limitations under the License.
 """ GPTBigCode configuration"""
 
+from enum import IntEnum
+
 from ...configuration_utils import PretrainedConfig
 from ...utils import logging
 
@@ -23,6 +25,19 @@ logger = logging.get_logger(__name__)
 GPT_BIGCODE_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "bigcode/gpt_bigcode-santacoder": "https://huggingface.co/bigcode/gpt_bigcode-santacoder/resolve/main/config.json",
 }
+
+
+class InferenceRunnerType(IntEnum):
+    NO_RUNNER = 0
+    # Use the inference runner without cuda graphs.
+    BASE_RUNNER = 1
+    # Use cuda graphs in the inference runner. Leave out the attention which has a variable shape.
+    # This significantly lowers the cpu time and prevent a cpu bottleneck for smaller batches and models.
+    PARTIAL_GRAPH = 2
+    # Turn the whole model into a cuda graph. One graph for each sequence length.
+    # Note: only useful for small batches and models, graphs take some time to generate, flaky.
+    # Crashes with jit on A100 but seems to work without jit (PYTORCH_JIT=0) and on V100.
+    FULL_GRAPH = 3
 
 
 class GPTBigCodeConfig(PretrainedConfig):
@@ -119,6 +134,12 @@ class GPTBigCodeConfig(PretrainedConfig):
         attention_softmax_in_fp32=True,
         scale_attention_softmax_in_fp32=True,
         multi_query=True,
+        inference_runner=InferenceRunnerType.NO_RUNNER,
+        validate_runner_input=True,
+        pre_allocate_kv_cache=False,
+        max_sequence_length=None,
+        max_batch_size=None,
+        pad_key_length=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -141,5 +162,17 @@ class GPTBigCodeConfig(PretrainedConfig):
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+
+        self.inference_runner = InferenceRunnerType(inference_runner)
+        # Set to False to disable input validation of safe inputs, for a small speedup.
+        self.validate_runner_input = validate_runner_input
+
+        self.pre_allocate_kv_cache = pre_allocate_kv_cache
+        # The max sequence length for the pre-allocated KV cache (`n_positions` if not provided).
+        self.max_sequence_length = max_sequence_length
+        # The max batch size for the pre-allocated KV cache, (deduce from input if not provided).
+        self.max_batch_size = max_batch_size
+        # Pad key length to a multiple of 8 (requires pre_allocate_kv_cache).
+        self.pad_key_length = pad_key_length
 
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
