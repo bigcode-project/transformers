@@ -17,25 +17,23 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
+from configuration_gpt_bigcode import GPTBigCodeConfig
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-
-from ...activations import ACT2FN
-from ...modeling_outputs import (
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from ...modeling_utils import PreTrainedModel
-from ...utils import (
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
 )
-from .configuration_gpt_bigcode import GPTBigCodeConfig
-
 
 logger = logging.get_logger(__name__)
 
@@ -93,6 +91,97 @@ def _apply_rotary_embeddings(
     return torch.view_as_real(complex_tensor * rope_frequencies).view_as(tensor).type_as(tensor)
 
 
+# rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
+@torch.jit.script
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class StarcoderRotaryEmbedding(nn.Module):
+    """Implementation of RotaryEmbedding from GPT-NeoX."""
+
+    def __init__(self, head_dim: int, base=10000):
+        super().__init__()
+        self.base = base
+        self.head_dim = head_dim
+        self.seq_len_cached = -1
+        # TODO @nouamane: Figure out why we can't set `DTypeInvariantTensor` ...
+        self.inv_freq: torch.Tensor
+        self.register_buffer(
+            "inv_freq",
+            torch.empty(head_dim // 2, dtype=torch.float),
+            persistent=False,
+        )
+        self.cos_cached: Optional[torch.Tensor] = None
+        self.sin_cached: Optional[torch.Tensor] = None
+        self._initialized_buffer = False
+
+    def init_rotary_embeddings(self):
+        if self._initialized_buffer is True:
+            # Buffer if already initialized
+            return
+
+        assert self.inv_freq.device.type == "cuda"
+        # TODO @nouamane: One we figure out how to do the DTypeInvariantTensor, this can be removed and changed to an assert
+        if self.inv_freq.dtype != torch.float:
+            self.inv_freq = self.inv_freq.to(torch.float)
+        assert self.inv_freq.dtype == torch.float
+
+        self.inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.head_dim, 2, dtype=torch.float, device="cuda") / self.head_dim)
+        )
+
+        self._initialized_buffer = True
+
+    def cos_sin(self, seq_len: int, past_key_values_length: int, device="cpu", dtype=torch.bfloat16) -> torch.Tensor:
+        total_length = seq_len + past_key_values_length
+        if total_length > self.seq_len_cached:
+            self.seq_len_cached = total_length
+            t = torch.arange(total_length, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            emb = torch.cat((freqs, freqs), dim=-1)  # [seq_len, head_dim]
+
+            if dtype in [torch.float16, torch.bfloat16]:
+                emb = emb.float()
+
+            self.cos_cached = emb.cos()[None, :, None, :]  # [1, seq_len, 1, head_dim]
+            self.sin_cached = emb.sin()[None, :, None, :]
+
+            self.cos_cached = self.cos_cached.type(dtype)
+            self.sin_cached = self.sin_cached.type(dtype)
+
+        return (
+            self.cos_cached[:, past_key_values_length : seq_len + past_key_values_length],
+            self.sin_cached[:, past_key_values_length : seq_len + past_key_values_length],
+        )
+
+    def forward(self, query, key, past_key_values_length=0):
+        """
+        Args:
+            query: [batch_size, seq_len, num_heads, head_dim]
+            key: [batch_size, seq_len, num_heads_k, head_dim]
+            past_key_values_length: int
+
+        Returns:
+            query: [batch_size, seq_len, num_heads, head_dim]
+            key: [batch_size, seq_len, num_heads_k, head_dim]
+        """
+        if self._initialized_buffer is False:
+            self.init_rotary_embeddings()
+        seq_len = query.shape[1]
+        cos, sin = self.cos_sin(
+            seq_len, past_key_values_length, query.device, query.dtype
+        )  # [1, seq_len, 1, head_dim]
+        query = (query * cos) + (rotate_half(query) * sin)
+        key = (key * cos) + (rotate_half(key) * sin)
+        if past_key_values_length > 0:
+            assert (
+                query.shape[1] == 1
+            ), f"past_key_values_length={past_key_values_length} but query.shape[1]={query.shape[1]}"
+        return query, key
+
+
 class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
@@ -129,6 +218,13 @@ class GPTBigCodeAttention(nn.Module):
             self.q_attn = nn.Linear(self.embed_dim, self.embed_dim)
         else:
             self.c_attn = nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_dim)
+
+        if self.use_rotary_embeddings:
+            self.maybe_rotary = (
+                StarcoderRotaryEmbedding(head_dim=self.head_dim)
+                if config.use_rotary_embeddings
+                else lambda q, k, t: (q, k)
+            )
 
         self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
@@ -229,7 +325,7 @@ class GPTBigCodeAttention(nn.Module):
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
-        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None
+        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None,
     ) -> Union[
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
@@ -246,6 +342,8 @@ class GPTBigCodeAttention(nn.Module):
             attention_mask = encoder_attention_mask
         elif self.multi_query:
             query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            # query shape: (batch_size, query_length, num_heads * head_dim)
+            # key_value shape: (batch_size, query_length, 2 * 1 * head_dim)
         else:
             # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
             # i.e., the memory layout is not the same as GPT2.
@@ -258,14 +356,33 @@ class GPTBigCodeAttention(nn.Module):
             )
 
         if layer_past is not None:
-            key_value = torch.cat((layer_past, key_value), dim=-2)
-        present = key_value if use_cache else None
+            past_kv_length = layer_past[0].shape[-2]
+        else:
+            past_kv_length = 0
 
-        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
+        key, value = key_value.split(
+            (self.head_dim, self.head_dim), dim=-1
+        )  # (batch_size, query_length, 1 * head_dim)
 
         if self.use_rotary_embeddings:
-            query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
-            key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
+            # query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
+            # key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
+            query = query.view(*query.shape[:2], self.num_heads, self.head_dim)
+            key = key.view(*key.shape[:2], 1, self.head_dim)
+            query, key = self.maybe_rotary(query, key, past_kv_length)
+            query = query.view(*query.shape[:2], self.num_heads * self.head_dim)
+            key = key.view(*key.shape[:2], 1 * self.head_dim)
+
+        if layer_past is not None:
+            # Concatenate past key/values with new key/values.
+            if self.use_rotary_embeddings:
+                key_value = torch.cat((key, value), dim=-1)
+            key_value = torch.cat((layer_past, key_value), dim=-2)
+            key, value = key_value.split(
+                (self.head_dim, self.head_dim), dim=-1
+            )  # (batch_size, key_length, 1 * head_dim)
+
+        present = key_value if use_cache else None
 
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
@@ -331,7 +448,7 @@ class GPTBigCodeBlock(nn.Module):
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
         rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
-        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None
+        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None,
     ) -> Union[
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
@@ -345,7 +462,7 @@ class GPTBigCodeBlock(nn.Module):
             use_cache=use_cache,
             output_attentions=output_attentions,
             rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
-            rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
+            rotary_embedding_frequencies_k=rotary_embedding_frequencies_k,
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -369,7 +486,7 @@ class GPTBigCodeBlock(nn.Module):
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
                 rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
-                rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
+                rotary_embedding_frequencies_k=rotary_embedding_frequencies_k,
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -536,20 +653,17 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         if config.use_position_embeddings:
             self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-        if config.use_rotary_embeddings:
-            # Calculate the complex frequencies (https://blog.eleuther.ai/rotary-embeddings/)
-            # `exp(i * n * a) = cos(n * a) + i sin(n * a)`,
-            # `a = theta ** - (2 * (channel // 2) / kv_channels)`,
-            # where n is the position in the sequence.
-            kv_channels = config.n_embd / config.n_head
-            angles = torch.outer(
-                torch.arange(config.max_position_embeddings, dtype=torch.float32),
-                torch.exp(
-                    config.rotary_embedding_scale
-                    * torch.arange(0, 1, 2 / kv_channels, dtype=torch.float32)
-                ),
-            )
-            self._rotary_embedding_frequencies = torch.polar(torch.ones_like(angles), angles)[None, :, None, :]
+        # if config.use_rotary_embeddings:
+        #     # Calculate the complex frequencies (https://blog.eleuther.ai/rotary-embeddings/)
+        #     # `exp(i * n * a) = cos(n * a) + i sin(n * a)`,
+        #     # `a = theta ** - (2 * (channel // 2) / kv_channels)`,
+        #     # where n is the position in the sequence.
+        #     kv_channels = config.n_embd / config.n_head
+        #     angles = torch.outer(
+        #         torch.arange(config.max_position_embeddings, dtype=torch.float32),
+        #         torch.exp(config.rotary_embedding_scale * torch.arange(0, 1, 2 / kv_channels, dtype=torch.float32)),
+        #     )
+        #     self._rotary_embedding_frequencies = torch.polar(torch.ones_like(angles), angles)[None, :, None, :]
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
@@ -638,13 +752,17 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         elif position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
-        
+
         # Rotary frequencies
         rotary_embedding_frequencies_q = None
         rotary_embedding_frequencies_k = None
-        if self.config.use_rotary_embeddings:
-            rotary_embedding_frequencies_q = self._rotary_embedding_frequencies[:, past_length : past_length + input_shape[-1]].to(device=device)
-            rotary_embedding_frequencies_k = self._rotary_embedding_frequencies[:, :past_length + input_shape[-1], :, :].to(device=device)
+        # if self.config.use_rotary_embeddings:
+        #     rotary_embedding_frequencies_q = self._rotary_embedding_frequencies[
+        #         :, past_length : past_length + input_shape[-1]
+        #     ].to(device=device)
+        #     rotary_embedding_frequencies_k = self._rotary_embedding_frequencies[
+        #         :, : past_length + input_shape[-1], :, :
+        #     ].to(device=device)
 
         # Self-attention mask.
         query_length = input_shape[-1]
@@ -712,7 +830,13 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, use_cache, output_attentions, rotary_embedding_frequencies_q, rotary_embedding_frequencies_k)
+                        return module(
+                            *inputs,
+                            use_cache,
+                            output_attentions,
+                            rotary_embedding_frequencies_q,
+                            rotary_embedding_frequencies_k,
+                        )
 
                     return custom_forward
 
@@ -736,7 +860,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                     rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
-                    rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
+                    rotary_embedding_frequencies_k=rotary_embedding_frequencies_k,
                 )
 
             hidden_states = outputs[0]
