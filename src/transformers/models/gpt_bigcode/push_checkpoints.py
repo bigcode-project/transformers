@@ -54,7 +54,11 @@ def main(argv=None):
         last_commit_iter = -1
 
     # The checkpoint dirs should be in ascending iteration order, so that the last commit corresponds to the latest checkpoint
-    ckpt_dirs = sorted([x for x in (args.exp_dir / "checkpoints").iterdir() if re.match(r"(\d+)", x.name) and x.is_dir()])
+    ckpt_dirs = sorted(
+        [x for x in (args.exp_dir / "checkpoints").iterdir() if re.match(r"(\d+)", x.name) and x.is_dir()],
+        key=lambda p: get_iter_number(p.name)
+    )
+    print(f"Found the following checkpoints: {ckpt_dirs}")
 
     for ckpt_dir in ckpt_dirs:
         iter_number = get_iter_number(ckpt_dir.name)
