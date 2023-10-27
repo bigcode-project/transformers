@@ -94,6 +94,12 @@ def convert_fast_llm_checkpoint(state_dict, config):
         if op_name == "final_layernorm":
             assert layer_index == config.n_layer + 1
             output_state_dict[f"transformer.ln_f.{weight_or_bias}"] = value
+        # Bias was not used in training for InputParallel layers
+        elif op_name == "self_attn.dense" and weight_or_bias == "bias":
+            output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
+        # MLP layer-2 is also InputParallel
+        elif op_name == "_mlp._layer_2" and weight_or_bias == "bias":
+            output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
         else:
             output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = value
 
