@@ -17,23 +17,25 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.utils.checkpoint
-from configuration_gpt_bigcode import GPTBigCodeConfig
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-from transformers.activations import ACT2FN
-from transformers.modeling_outputs import (
+
+from ...activations import ACT2FN
+from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     CausalLMOutputWithCrossAttentions,
     SequenceClassifierOutputWithPast,
     TokenClassifierOutput,
 )
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import (
+from ...modeling_utils import PreTrainedModel
+from ...utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
     logging,
 )
+from .configuration_gpt_bigcode import GPTBigCodeConfig
+
 
 logger = logging.get_logger(__name__)
 
