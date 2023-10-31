@@ -140,6 +140,7 @@ class StarcoderRotaryEmbedding(nn.Module):
         total_length = seq_len + past_key_values_length
         if total_length > self.seq_len_cached:
             self.seq_len_cached = total_length
+            assert self.inv_freq.dtype == torch.float
             t = torch.arange(total_length, device=device, dtype=self.inv_freq.dtype)
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             emb = torch.cat((freqs, freqs), dim=-1)  # [seq_len, head_dim]
@@ -358,7 +359,7 @@ class GPTBigCodeAttention(nn.Module):
             )
 
         if layer_past is not None:
-            past_kv_length = layer_past[0].shape[-2]
+            past_kv_length = layer_past.shape[-2]
         else:
             past_kv_length = 0
 
@@ -371,21 +372,25 @@ class GPTBigCodeAttention(nn.Module):
             # key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
             query = query.view(*query.shape[:2], self.num_heads, self.head_dim)
             key = key.view(*key.shape[:2], 1, self.head_dim)
+            # print(past_kv_length)
+            # print("before",key[0,:,0,0])
             query, key = self.maybe_rotary(query, key, past_kv_length)
+            # print("after",key[0,:,0,0])
             query = query.view(*query.shape[:2], self.num_heads * self.head_dim)
             key = key.view(*key.shape[:2], 1 * self.head_dim)
 
+        if use_cache:
+            key_value = torch.cat((key, value), dim=-1)
+
         if layer_past is not None:
             # Concatenate past key/values with new key/values.
-            if self.use_rotary_embeddings:
-                key_value = torch.cat((key, value), dim=-1)
             key_value = torch.cat((layer_past, key_value), dim=-2)
             key, value = key_value.split(
                 (self.head_dim, self.head_dim), dim=-1
             )  # (batch_size, key_length, 1 * head_dim)
+            # print("after past", key[0,:,0])
 
         present = key_value if use_cache else None
-
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
         if not self.multi_query:
