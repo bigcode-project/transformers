@@ -424,7 +424,7 @@ class GPTBigCodeAttention(nn.Module):
         if self.use_rotary_embeddings:
             # query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
             # key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
-            query = query.view(*query.shape[:2], self.num_heads, self.head_dim)
+            query = query.reshape(*query.shape[:2], self.num_heads, self.head_dim)
             key = key.view(*key.shape[:2], self.kv_heads, self.head_dim)
             # print(past_kv_length)
             # print("before",key[0,:,0,0])
@@ -432,7 +432,7 @@ class GPTBigCodeAttention(nn.Module):
             # print("after",key[0,:,0,0])
             query = query.view(*query.shape[:2], self.num_heads * self.head_dim)
             key = key.view(*key.shape[:2], self.kv_heads * self.head_dim)
-            value = value.view(*value.shape[:2], self.kv_heads*self.head_dim)
+            value = value.reshape(*value.shape[:2], self.kv_heads*self.head_dim)
 
         if use_cache:
             key_value = torch.cat((key, value), dim=-1)
