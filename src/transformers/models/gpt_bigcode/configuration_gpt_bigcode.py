@@ -50,6 +50,14 @@ class GPTBigCodeConfig(PretrainedConfig):
             Number of hidden layers in the Transformer encoder.
         n_head (`int`, *optional*, defaults to 12):
             Number of attention heads for each attention layer in the Transformer encoder.
+        num_key_value_heads (`int`, *optional*):
+            This is the number of key_value heads that should be used to implement Grouped Query Attention. If
+            `num_key_value_heads=num_attention_heads`, the model will use Multi Head Attention (MHA), if
+            `num_key_value_heads=1 the model will use Multi Query Attention (MQA) otherwise GQA is used. When
+            converting a multi-head checkpoint to a GQA checkpoint, each group key and value head should be constructed
+            by meanpooling all the original heads within that group. For more details checkout [this
+            paper](https://arxiv.org/pdf/2305.13245.pdf). If it is not specified, will default to
+            `num_attention_heads`.
         n_inner (`int`, *optional*, defaults to None):
             Dimensionality of the inner feed-forward layers. `None` will set it to 4 times n_embd
         activation_function (`str`, *optional*, defaults to `"gelu_pytorch_tanh"`):
@@ -106,6 +114,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         n_embd=768,
         n_layer=12,
         n_head=12,
+        num_key_value_heads=None,
         n_inner=None,
         activation_function="gelu_pytorch_tanh",
         resid_pdrop=0.1,
@@ -131,6 +140,12 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.n_embd = n_embd
         self.n_layer = n_layer
         self.n_head = n_head
+
+        # for backward compatibility
+        if num_key_value_heads is None:
+            num_key_value_heads = 1 if multi_query else n_head
+        self.num_key_value_heads = num_key_value_heads
+
         self.n_inner = n_inner
         self.activation_function = activation_function
         self.resid_pdrop = resid_pdrop

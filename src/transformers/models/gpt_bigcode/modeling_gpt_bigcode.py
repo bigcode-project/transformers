@@ -190,12 +190,13 @@ class GPTBigCodeAttention(nn.Module):
         super().__init__()
         self.mask_value = None
 
+        # self.multi_query = config.num_key_value_heads == 1
         self.multi_query = config.multi_query
+        assert not config.multi_query or (config.multi_query and config.num_key_value_heads == 1), f"Got MQA with num_key_value_heads = {config.num_key_value_heads}"
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.kv_heads = 1 if self.multi_query else self.num_heads
-        self.kv_dim = self.kv_heads * self.head_dim
+        self.kv_heads = config.num_key_value_heads
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
@@ -216,11 +217,13 @@ class GPTBigCodeAttention(nn.Module):
         if self.is_cross_attention:
             if self.multi_query:
                 raise NotImplementedError("Multi-Query Attention not supported for cross_attention")
+            if self.kv_heads != self.num_heads:
+                raise NotImplementedError("Cross-Attention not supported for num_key_value_heads != num_attention_heads")
 
             self.c_attn = nn.Linear(self.embed_dim, 2 * self.embed_dim)
             self.q_attn = nn.Linear(self.embed_dim, self.embed_dim)
         else:
-            self.c_attn = nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_dim)
+            self.c_attn = nn.Linear(self.embed_dim, self.embed_dim + 2 * self.kv_heads * self.head_dim)
 
         if self.use_rotary_embeddings:
             self.maybe_rotary = (
@@ -241,6 +244,13 @@ class GPTBigCodeAttention(nn.Module):
         return self.mask_value
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+        """
+        Args:
+            query (batch_size, query_length, num_heads * head_dim)
+            key (batch_size, kv_heads*head_dim, key_length)
+            value (batch_size, key_length, kv_heads, head_dim)
+
+        """
         dtype = query.dtype
         softmax_dtype = torch.float32 if self.attention_softmax_in_fp32 else dtype
         upcast = dtype != softmax_dtype
@@ -263,6 +273,31 @@ class GPTBigCodeAttention(nn.Module):
             attn_view = (batch_size, query_length * self.num_heads, key_length)
             # No copy needed for MQA 2, or when layer_past is provided.
             query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+            # value shape (batch_size, key_length, 1, head_dim)
+            # print("value", value.shape)
+            # print(value[0, :, 0, 0])
+        elif self.kv_heads < self.num_heads: # GQA
+            # (batch_size, query_length, num_heads, head_dim) x (batch_size, kv_heads, head_dim, key_length)
+            # -> (batch_size, num_heads, query_length, key_length)
+            query_length = query_shape[1]
+            attn_shape = (batch_size, self.num_heads, query_length, key_length)
+            attn_view = (batch_size * self.num_heads, query_length, key_length)
+            # Always copies
+            query = query.view(batch_size, query_length, self.num_heads, self.head_dim)
+            query = query.transpose(1,2).reshape(batch_size * self.num_heads, query_length, self.head_dim)
+            # query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
+            # Need to repeat key/value for each query -> we need kv_heads dim to precede key_length dim
+            # key shape: (batch_size, kv_heads, head_dim, key_length)
+            n_repeats = self.num_heads // self.kv_heads
+            key = (key.view(batch_size, self.kv_heads, 1, self.head_dim, key_length)
+                    .expand(batch_size, self.kv_heads, n_repeats, self.head_dim, key_length)
+                    .reshape(batch_size * self.num_heads, self.head_dim, key_length))
+            value = value.transpose(1,2)
+            value = (value.view(batch_size, self.kv_heads, 1, key_length, self.head_dim)
+                    .expand(batch_size, self.kv_heads, n_repeats, key_length, self.head_dim)
+                    .reshape(batch_size * self.num_heads, key_length, self.head_dim))
+            # print("value", value.shape)
+            # print(value[0, :, 0])
         else:
             # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
             # -> (batch_size, num_heads, query_length, key_length)
@@ -274,6 +309,11 @@ class GPTBigCodeAttention(nn.Module):
             # No copy when layer_past is provided.
             key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
 
+        # print("query", query.shape)
+        # print(query[0, :query_length, 0])
+        # print("key", key.shape)
+        # print(key[0, 0, :])
+
         attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
         if query.device.type == "cpu":
             # This is needed because of a bug in pytorch https://github.com/pytorch/pytorch/issues/80588.
@@ -284,6 +324,11 @@ class GPTBigCodeAttention(nn.Module):
         else:
             beta = 0
         attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
+        # if not self.multi_query:
+        #     attn_weights = attn_weights.transpose(1, 2) # (batch_size, query_length, num_heads, key_length)
+        # print("attn_weights", attn_weights.shape)
+        # print(attn_weights[0, :, 0, :])
+        # assert False, "done"
 
         if upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
@@ -311,6 +356,7 @@ class GPTBigCodeAttention(nn.Module):
             attn_weights = attn_weights * head_mask
 
         if self.multi_query:
+            # value shape: (batch_size, key_length, 1, head_dim)
             attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
         else:
             attn_output = torch.matmul(attn_weights, value)
@@ -333,6 +379,8 @@ class GPTBigCodeAttention(nn.Module):
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
     ]:
+        # self.multi_query = False
+        # self.multi_query = True
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn") or not self.is_cross_attention:
                 raise ValueError(
@@ -344,43 +392,51 @@ class GPTBigCodeAttention(nn.Module):
             key_value = self.c_attn(encoder_hidden_states)
             attention_mask = encoder_attention_mask
         elif self.multi_query:
-            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_heads * self.head_dim), dim=2)
             # query shape: (batch_size, query_length, num_heads * head_dim)
             # key_value shape: (batch_size, query_length, 2 * 1 * head_dim)
+            key, value = key_value.split(
+                (self.head_dim, self.head_dim), dim=-1
+            )  # (batch_size, query_length, 1 * head_dim)
         else:
             # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
             # i.e., the memory layout is not the same as GPT2.
             # This makes the concatenation with past_key_value more efficient.
-            query, key_value = (
+
+            n_repeats = self.num_heads // self.kv_heads
+
+            query, key, value = (
                 self.c_attn(hidden_states)
-                .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
-                .transpose(1, 2)
-                .split((self.head_dim, 2 * self.head_dim), dim=3)
-            )
+                .view(*hidden_states.shape[:2], self.kv_heads, n_repeats + 2, self.head_dim)
+                .split((n_repeats, 1, 1), dim=3)
+            ) 
+            # print("c_attn query", query.shape)
+            # print("c_attn key", key.shape)
+            # query shape: (batch_size, query_length, kv_heads, n_repeats, head_dim)
+            # key, value shape: (batch_size, query_length, kv_heads, 1, head_dim)
 
         if layer_past is not None:
             past_kv_length = layer_past.shape[-2]
         else:
             past_kv_length = 0
 
-        key, value = key_value.split(
-            (self.head_dim, self.head_dim), dim=-1
-        )  # (batch_size, query_length, 1 * head_dim)
 
         if self.use_rotary_embeddings:
             # query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
             # key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
             query = query.view(*query.shape[:2], self.num_heads, self.head_dim)
-            key = key.view(*key.shape[:2], 1, self.head_dim)
+            key = key.view(*key.shape[:2], self.kv_heads, self.head_dim)
             # print(past_kv_length)
             # print("before",key[0,:,0,0])
             query, key = self.maybe_rotary(query, key, past_kv_length)
             # print("after",key[0,:,0,0])
             query = query.view(*query.shape[:2], self.num_heads * self.head_dim)
-            key = key.view(*key.shape[:2], 1 * self.head_dim)
+            key = key.view(*key.shape[:2], self.kv_heads * self.head_dim)
+            value = value.view(*value.shape[:2], self.kv_heads, self.head_dim)
 
         if use_cache:
             key_value = torch.cat((key, value), dim=-1)
+            # TODO @nouamane: do we need to concat?
 
         if layer_past is not None:
             # Concatenate past key/values with new key/values.
