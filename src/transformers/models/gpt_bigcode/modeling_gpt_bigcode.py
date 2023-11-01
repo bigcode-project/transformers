@@ -432,7 +432,7 @@ class GPTBigCodeAttention(nn.Module):
             # print("after",key[0,:,0,0])
             query = query.view(*query.shape[:2], self.num_heads * self.head_dim)
             key = key.view(*key.shape[:2], self.kv_heads * self.head_dim)
-            value = value.view(*value.shape[:2], self.kv_heads, self.head_dim)
+            value = value.view(*value.shape[:2], self.kv_heads*self.head_dim)
 
         if use_cache:
             key_value = torch.cat((key, value), dim=-1)
@@ -440,13 +440,14 @@ class GPTBigCodeAttention(nn.Module):
 
         if layer_past is not None:
             # Concatenate past key/values with new key/values.
-            key_value = torch.cat((layer_past, key_value), dim=-2)
+            key_value = torch.cat((layer_past, key_value), dim=1)
             key, value = key_value.split(
-                (self.head_dim, self.head_dim), dim=-1
-            )  # (batch_size, key_length, 1 * head_dim)
+                (self.kv_heads * self.head_dim, self.kv_heads * self.head_dim), dim=-1
+            )  # (batch_size, key_length, kv_heads * head_dim)
             # print("after past", key[0,:,0])
 
         present = key_value if use_cache else None
+        value = value.view(*value.shape[:2], self.kv_heads, self.head_dim)
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
         if not self.multi_query:
