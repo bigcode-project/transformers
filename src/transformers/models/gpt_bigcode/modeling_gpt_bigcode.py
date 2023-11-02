@@ -289,13 +289,15 @@ class GPTBigCodeAttention(nn.Module):
             # Need to repeat key/value for each query -> we need kv_heads dim to precede key_length dim
             # key shape: (batch_size, kv_heads, head_dim, key_length)
             n_repeats = self.num_heads // self.kv_heads
+            # TODO @nouamane: refactor this
             key = (key.view(batch_size, self.kv_heads, 1, self.head_dim, key_length)
                     .expand(batch_size, self.kv_heads, n_repeats, self.head_dim, key_length)
                     .reshape(batch_size * self.num_heads, self.head_dim, key_length))
+            value = value.view(batch_size, key_length, self.kv_heads, self.head_dim)
             value = value.transpose(1,2)
             value = (value.view(batch_size, self.kv_heads, 1, key_length, self.head_dim)
                     .expand(batch_size, self.kv_heads, n_repeats, key_length, self.head_dim)
-                    .reshape(batch_size * self.num_heads, key_length, self.head_dim))
+                    .reshape(batch_size, self.num_heads, key_length, self.head_dim))
             # print("value", value.shape)
             # print(value[0, :, 0])
         else:
@@ -447,7 +449,6 @@ class GPTBigCodeAttention(nn.Module):
             # print("after past", key[0,:,0])
 
         present = key_value if use_cache else None
-        value = value.view(*value.shape[:2], self.kv_heads, self.head_dim)
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
         if not self.multi_query:
