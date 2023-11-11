@@ -681,6 +681,9 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         # Attention-shape: (batch_size, query_length, n_heads, key_length)
         attention_mask = self_attention_mask.unsqueeze(2)
+        if self.kv_heads > 1:
+            # (batch_size, self.kv_heads, query_length, heads_per_group, key_length)
+            attention_mask = attention_mask.unsqueeze(1)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
