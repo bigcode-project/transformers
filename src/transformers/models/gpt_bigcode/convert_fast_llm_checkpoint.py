@@ -35,6 +35,7 @@ def convert_fast_llm_checkpoint(state_dict, config):
         n_embd=config["hidden_size"],
         n_layer=config["num_layers"],
         n_head=config["num_attention_heads"],
+        head_groups=config.get("head_groups", None),
         n_inner=config["ffn_hidden_size"],
         activation_function="gelu",  # TODO
         multi_query=True,  # TODO
