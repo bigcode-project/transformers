@@ -89,7 +89,7 @@ def _apply_rotary_embeddings(
     * Convert back tho the input format.
     # TODO: Full precision only needed for bfloat16? (Doesn't support complex numbers)
     """
-    complex_tensor = torch.view_as_complex(tensor.float().view(*tensor.shape[:-1], -1, rope_frequencies.size(-1), 2))
+    complex_tensor = torch.view_as_complex(tensor.float().view(*tensor.shape[:-1], -1, 2, rope_frequencies.size(-1)).transpose(-2, -1).contiguous())
     return torch.view_as_real(complex_tensor * rope_frequencies).view_as(tensor).type_as(tensor)
 
 
