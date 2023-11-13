@@ -37,6 +37,7 @@ import os
 import re
 
 import torch
+import math
 
 from transformers.models.gpt_bigcode import GPTBigCodeConfig, GPTBigCodeForCausalLM, GPTBigCodeModel
 
