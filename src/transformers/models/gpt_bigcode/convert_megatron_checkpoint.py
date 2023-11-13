@@ -128,7 +128,7 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
         attention_softmax_in_fp32=attention_softmax_in_fp32,
         scale_attention_softmax_in_fp32=True,
         use_rotary_embeddings=ds_args.use_rotary_position_embeddings,
-        rotary_embedding_scale=ds_args.rotary_theta, 
+        rotary_embedding_scale=-math.log(ds_args.rotary_theta), 
         use_position_embeddings=ds_args.add_position_embedding,
     )
 
