@@ -208,16 +208,20 @@ def convert_megatron_checkpoint(input_state_dict, merge_qkv):
     return config, output_state_dict
 
 
-def test_conversion(checkpoint_path, tokenizer_path):
+def test_conversion(checkpoint_path, tokenizer_path, device="cpu", prompt=None):
     from transformers import AutoTokenizer
+    from transformers.models.gpt_bigcode import GPTBigCodeForCausalLM
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = GPTBigCodeForCausalLM.from_pretrained(checkpoint_path, torch_dtype=torch.bfloat16, device_map="cuda")
-    text = "def fibonnaci(n"
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
-    print(f"Testing generation with prompt '{text}'")
-    print(f"Input ids: {inputs['input_ids']}")
-    output = model.generate(**inputs, max_new_tokens=128, do_sample=False)
-    print(tokenizer.decode(output[0]))
+    model = GPTBigCodeForCausalLM.from_pretrained(checkpoint_path, torch_dtype=torch.bfloat16, device_map=device)
+    prompt_1 = 'def separate_paren_groups(paren_string: str) -> List[str]:\n    """ Input to this function is a string containing multiple groups of nested parentheses. Your goal is to\n    separate those group into separate strings and return the list of those.\n    Separate groups are balanced (each open brace is properly closed) and not nested within each other\n    Ignore any spaces in the input string.\n    >>> separate_paren_groups(\'( ) (( )) (( )( ))\')\n    [\'()\', \'(())\', \'(()())\']\n    """'
+    prompt_2 = 'def fibonnaci(n'
+    prompts = [prompt_1, prompt_2]
+    for text in prompts:
+        inputs = tokenizer(text, return_tensors="pt").to(device)
+        print(f"Testing generation with prompt '{text}'")
+        print(f"Input ids: {inputs['input_ids']}")
+        output = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+        print(tokenizer.decode(output[0]))
 
 
 def main(argv=None):
