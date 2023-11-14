@@ -20,7 +20,11 @@ NAME_MAP = {
 }
 
 
-def convert_fast_llm_checkpoint(state_dict, config):
+def convert_fast_llm_checkpoint(state_dict, config, set_attn_dense_bias_zero, set_mlp_2_bias_zero):
+    if set_attn_dense_bias_zero:
+        print("Will set attention output layer biases to zero")
+    if set_mlp_2_bias_zero:
+        print("Will set MLP layer-2 biases to zero")
     # The converted output model.
     output_state_dict = {}
     if "window_size" in config:
@@ -95,6 +99,12 @@ def convert_fast_llm_checkpoint(state_dict, config):
         if op_name == "final_layernorm":
             assert layer_index == config.n_layer + 1
             output_state_dict[f"transformer.ln_f.{weight_or_bias}"] = value
+        # Bias was not used in training for InputParallel layers
+        elif op_name == "self_attn.dense" and weight_or_bias == "bias" and set_attn_dense_bias_zero:
+            output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
+        # MLP layer-2 is also InputParallel
+        elif op_name == "_mlp._layer_2" and weight_or_bias == "bias" and set_mlp_2_bias_zero:
+            output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
         else:
             output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = value
 
@@ -116,6 +126,19 @@ def main(argv=None):
         type=Path,
         help="Path where the converted model is saved"
     )
+    parser.add_argument(
+        "--set_attn_dense_bias_zero",
+        action='store_true',
+        default=False,
+        help="Set the attention output layer bias to zero and ignore the value from the checkpoint. Shouldn't be used except to fix a bug from training."
+    )
+    parser.add_argument(
+        "--set_mlp_2_bias_zero",
+        action='store_true',
+        default=False,
+        help="Set the MLP second layer bias to zero and ignore the value from the checkpoint. Shouldn't be used except to fix a bug from training."
+    )
+    
     args = parser.parse_args(argv)
 
     state_dict, config = merge_checkpoint(
@@ -123,7 +146,7 @@ def main(argv=None):
         dummy_experiment_dir=None
     )
     
-    output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
+    output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config, args.set_attn_dense_bias_zero, args.set_mlp_2_bias_zero)
     
     print("Saving config")
     save_dir = args.save_dir or args.checkpoint_dir / "converted"
