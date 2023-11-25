@@ -47,6 +47,34 @@ GPT_BIGCODE_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all GPTBigCode models at https://huggingface.co/models?filter=gpt_bigcode
 ]
 
+DEBUG_DIR = "/app/dataset/debug_logs/2/"
+DEBUG_LEVEL = 1000
+
+def log_tensor(tensor, name):
+    mu = tensor.mean().item()
+    std = tensor.std().item()
+    mini = tensor.min().item()
+    maxi = tensor.max().item()
+    # Get sample
+    target_samples = 2 ** (DEBUG_LEVEL - 3)
+    step = max(tensor.numel() // target_samples, 1)
+    while step > 1 and any(step % s == 0 and s > 1 for s in tuple(tensor.shape)):
+        step -= 1
+    samples = tensor.flatten()[: target_samples * step : step].cpu()
+    
+#     print(f"{name}: shape {tensor.shape}  mu: {mu:.5f}  std: {std:.5f}  min: {mini:.5f}  max: {maxi:.5f}")
+    torch.save({
+        'name': name,
+        'shape': tensor.shape,
+        'dtype': tensor.dtype,
+        'device': tensor.device,
+        'mu': mu,
+        'std': std,
+        'min': mini,
+        'max': maxi,
+        'samples': samples,
+        'step': step
+    }, f"{DEBUG_DIR}/{name}.pt")
 
 # Fused kernels
 # Use separate functions for each case because conditionals prevent kernel fusion.
@@ -286,8 +314,12 @@ class GPTBigCodeAttention(nn.Module):
             query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
             key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
 
+        log_tensor(query, f"layer {self.layer_idx} attn query")
+        log_tensor(key, f"layer {self.layer_idx} attn key")
+        log_tensor(value, f"layer {self.layer_idx} attn value")
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
+        log_tensor(attn_output, f"layer {self.layer_idx} attn context")
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
@@ -325,6 +357,7 @@ class GPTBigCodeMLP(nn.Module):
 class GPTBigCodeBlock(nn.Module):
     def __init__(self, config, layer_idx=None):
         super().__init__()
+        self.layer_idx = layer_idx
         hidden_size = config.hidden_size
         self.inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
@@ -357,6 +390,7 @@ class GPTBigCodeBlock(nn.Module):
     ]:
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
+        log_tensor(hidden_states, f"layer {self.layer_idx} Layer norm 1")
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
@@ -369,8 +403,10 @@ class GPTBigCodeBlock(nn.Module):
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
+        log_tensor(attn_output, f"layer {self.layer_idx} Attn output")
         # residual connection
         hidden_states = attn_output + residual
+        log_tensor(hidden_states, f"layer {self.layer_idx} Attn residual")
 
         if encoder_hidden_states is not None:
             # add one self-attention block for cross-attention
@@ -398,7 +434,9 @@ class GPTBigCodeBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)
+        log_tensor(hidden_states, f"layer {self.layer_idx} Layer norm 2")
         feed_forward_hidden_states = self.mlp(hidden_states)
+        log_tensor(feed_forward_hidden_states, f"layer {self.layer_idx} MLP output")
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
