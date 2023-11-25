@@ -54,7 +54,7 @@ def convert_fast_llm_checkpoint(state_dict, config, set_attn_dense_bias_zero, se
     )
 
     # Truncate the word embeddings to the vocab-size
-    u="_" if version>=1 else ""
+    u="_" if version==0 else ""
     word_embeddings = state_dict.pop(f"{u}layers.0.{u}word_embeddings_weight")[:config.vocab_size, :]
     output_state_dict["transformer.wte.weight"] = word_embeddings
     if config.use_position_embeddings:
@@ -102,7 +102,7 @@ def convert_fast_llm_checkpoint(state_dict, config, set_attn_dense_bias_zero, se
         elif op_name == "self_attn.dense" and weight_or_bias == "bias" and set_attn_dense_bias_zero:
             output_state_dict[f"transformer.h.{layer_index-1}.{name_map[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
         # MLP layer-2 is also InputParallel
-        elif op_name == "_mlp._layer_2" and weight_or_bias == "bias" and set_mlp_2_bias_zero:
+        elif op_name == f"{u}mlp.{u}layer_2" and weight_or_bias == "bias" and set_mlp_2_bias_zero:
             output_state_dict[f"transformer.h.{layer_index-1}.{name_map[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
         else:
             output_state_dict[f"transformer.h.{layer_index-1}.{name_map[op_name]}.{weight_or_bias}"] = value
