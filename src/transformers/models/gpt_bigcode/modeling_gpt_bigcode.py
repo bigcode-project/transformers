@@ -14,7 +14,11 @@
 """PyTorch GPTBigCode model."""
 import math
 from typing import List, Optional, Tuple, Union
-
+from flash_attn import bert_padding
+from flash_attn.flash_attn_interface import (
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
+)
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -185,6 +189,33 @@ class StarcoderRotaryEmbedding(nn.Module):
         return query, key
 
 
+def pad_to_right(tensor, mask, new_tensor=None):
+    """Transform a left-padded tensor into a right-padded tensor. (Useful for prefilling key/value states)
+    Args:
+        tensor: (batch_size, seqlen, d1, d2)
+        mask: (batch_size, seqlen)
+        new_tensor: (batch_size, new_tensor_seqlen, d1, d2)
+    Returns:
+        new_tensor: (batch_size, new_tensor_seqlen, d1, d2)
+        right_padded_mask: (batch_size, seqlen)
+    """
+    # First, we need to find the number of padding for each row
+    unpad_seqlens = mask.sum(1)
+    # Then, we need to find the maximum length of the tensor
+    max_seqlen = mask.shape[1]
+    # We can then create the indices to select the padded values
+    # The indices are the same for each row
+    indices = torch.arange(max_seqlen, device=mask.device)
+    # We can then create the mask for the padded values
+    right_padded_mask = indices < unpad_seqlens[:, None]
+    # We select the useful values
+    useful_values = tensor[mask]
+    # We create the new tensor (if not provided)
+    new_tensor = torch.zeros_like(tensor) if new_tensor is None else new_tensor
+    # We fill the new tensor with the useful values
+    new_tensor[:, : right_padded_mask.shape[1], :, :][right_padded_mask] = useful_values
+    return new_tensor, right_padded_mask
+
 class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
@@ -236,6 +267,14 @@ class GPTBigCodeAttention(nn.Module):
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
+
+        self.prefill_kv_len = (
+            config.max_position_embeddings
+        )  # TODO @nouamane: compute based on free memory, because in rope we can surpass max_position_embeddings
+        self.n_local_kv_heads = self.kv_heads
+        self.n_local_q_heads = self.num_heads
+        self.n_repeats = self.num_heads // self.kv_heads
+
 
     def _get_mask_value(self, device, dtype):
         # torch.where expects a tensor. We use a cache to avoid recreating it every time.
@@ -365,11 +404,135 @@ class GPTBigCodeAttention(nn.Module):
 
         return attn_output, attn_weights
 
+    def _flash_attn(self, hidden_states, layer_past, sequence_mask, position_ids):
+        # hidden_states (batch_size, query_length, embed_dim)
+        # layer_past (batch_size, past_key_values_length, embed_dim)
+        # sequence_mask (batch_size, query_length)
+
+        fused_qkv = self.c_attn(
+            hidden_states
+        )  # [batch_size, query_length, n_local_q_heads * head_dim + 2 * n_local_kv_heads * head_dim]
+        batch_size, q_length, _ = fused_qkv.size()
+
+        qkv = fused_qkv.view(batch_size, q_length, self.n_local_kv_heads, self.n_repeats + 2, self.head_dim)
+        query, key, value = torch.split(qkv, [self.n_repeats, 1, 1], dim=3)
+        query_states = query.reshape(
+            batch_size, q_length, self.n_local_q_heads, self.head_dim
+        )
+        key_states = key.reshape(batch_size, q_length, self.n_local_kv_heads, self.head_dim)
+        value_states = value.reshape(batch_size, q_length, self.n_local_kv_heads, self.head_dim)
+
+        # Compute rotary embeddings
+        if layer_past is None:
+            past_key_values_length = 0
+        else:
+            past_key_values_length = layer_past.shape[1]
+        query_states, key_states = self.maybe_rotary(
+            query_states, key_states, past_key_values_length=past_key_values_length
+        )
+    
+        if layer_past is None:
+            # First inference iteration (Prefill)
+            # TODO @nouamane: support custom masking
+            # assert that [ False, False, False, False,  True,  True,  True,  True,  True,  True] is accepted
+            # but [ False, False, False, False,  True,  True,  False,  False,  True,  True] is not (can't mask in the middle of sequence)
+            assert ~(
+                sequence_mask[:, :-1] & (~sequence_mask[:, 1:])  # True is never followed by False
+            ).any(), f"Can't mask in the middle of sequence, please use USE_FAST=0 instead.\nGot sequence_mask: {sequence_mask}"
+
+            # preallocate k_cache, v_cache to self.prefill_kv_len
+            k_cache = torch.zeros(
+                (
+                    batch_size,
+                    self.prefill_kv_len,
+                    self.n_local_kv_heads,
+                    self.head_dim,
+                ),
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
+            v_cache = torch.zeros(
+                (batch_size, self.prefill_kv_len, self.n_local_kv_heads, self.head_dim),
+                dtype=query_states.dtype,
+                device=query_states.device,
+            )
+            self.register_buffer("k_cache", k_cache)
+            self.register_buffer("v_cache", v_cache)
+
+            # Remove pad tokens from key_states and concatenate samples in key_unpad
+            # cu_seqlens_k is the cumulative sequence lengths of key_states
+            (query_unpad, indices_q, cu_seqlens_q, max_seqlen_q) = bert_padding.unpad_input(
+                query_states,
+                sequence_mask,
+            )
+            (key_unpad, indices_k, cu_seqlens_k, max_seqlen_k) = bert_padding.unpad_input(
+                key_states, sequence_mask
+            )
+            (value_unpad, _, _, _) = bert_padding.unpad_input(value_states, sequence_mask)
+
+            output_unpad = flash_attn_varlen_func(
+                q=query_unpad,  # (total_q, self.n_local_q_heads, d_qk)
+                k=key_unpad,  # (total_kv, self.n_local_kv_heads, d_qk)
+                v=value_unpad,  # (total_kv, self.n_local_kv_heads, d_v)
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=True,  # True in prefill phase, False in subsequent phases
+                return_attn_probs=False,
+            )  # (total_unpadded, n_local_q_heads, d_v)
+
+            attention_output = bert_padding.pad_input(
+                output_unpad, indices_q, batch_size, q_length
+            )  # (batch_size, q_length, n_local_q_heads, d_v)
+            pad_to_right(key_states, sequence_mask, new_tensor=k_cache)
+            pad_to_right(value_states, sequence_mask, new_tensor=v_cache)
+
+        else:
+            # Pull pre-computed key/value states
+            # Subsequent inference iterations (q_length=1)
+            k_cache = self.k_cache
+            v_cache = self.v_cache
+            # TODO: remove layer_past as it's redundant with k_cache, v_cache
+
+            # [batch_size, seq_length, num_heads, d_qk]
+            query_states = query_states.view(
+                batch_size, q_length, self.n_local_q_heads, self.head_dim
+            )  # [batch_size, q_length, self.n_local_q_heads, self.head_dim]
+            kv_length = key_states.shape[1]
+            key_states = key_states.view(
+                batch_size, kv_length, self.n_local_kv_heads, self.head_dim
+            )  # [batch_size, kv_length, self.n_local_kv_heads, self.head_dim]
+            value_states = value_states.view(
+                batch_size, kv_length, self.n_local_kv_heads, self.head_dim
+            )  # [batch_size, kv_length, self.n_local_kv_heads, self.head_dim]
+
+            position_offsets = position_ids[:, -1]
+            # assert False
+            attention_output = flash_attn_with_kvcache(
+                query_states,
+                k_cache,
+                v_cache,
+                key_states,
+                value_states,
+                rotary_cos=None,
+                rotary_sin=None,
+                # TODO @nouamane: seems like this doesnt help to indicate padding in (for first iteration it's just 0)
+                cache_seqlens=position_offsets.contiguous(),
+                softmax_scale=None,
+                causal=True,
+                rotary_interleaved=False,  # GPT-NeoX style
+            )
+
+        return key_states, value_states, attention_output
+
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        layer_past: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor, # (batch_size, query_length, embed_dim)
+        layer_past: Optional[torch.Tensor] = None, # (batch_size, past_key_values_length, embed_dim)
+        attention_mask: Optional[torch.Tensor] = None, # (batch_size, query_length)
         head_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
@@ -377,10 +540,12 @@ class GPTBigCodeAttention(nn.Module):
         output_attentions: Optional[bool] = False,
         rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
         rotary_embedding_frequencies_k: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Union[
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
     ]:
+        USE_FLASH_ATTN = True
         # self.multi_query = False
         # self.multi_query = True
         if encoder_hidden_states is not None:
@@ -400,22 +565,25 @@ class GPTBigCodeAttention(nn.Module):
             key, value = key_value.split(
                 (self.head_dim, self.head_dim), dim=-1
             )  # (batch_size, query_length, 1 * head_dim)
-        else:
-            # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
-            # i.e., the memory layout is not the same as GPT2.
-            # This makes the concatenation with past_key_value more efficient.
+        else: # GQA
+            if use_cache and USE_FLASH_ATTN:
+                key, value, attn_output = self._flash_attn(hidden_states, layer_past, attention_mask, position_ids)
+                attn_output = attn_output.view(hidden_states.shape)
 
-            n_repeats = self.num_heads // self.kv_heads
+            else:
+                # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
+                # i.e., the memory layout is not the same as GPT2.
+                # This makes the concatenation with past_key_value more efficient.
 
-            query, key, value = (
-                self.c_attn(hidden_states)
-                .view(*hidden_states.shape[:2], self.kv_heads, n_repeats + 2, self.head_dim)
-                .split((n_repeats, 1, 1), dim=3)
-            ) 
-            # print("c_attn query", query.shape)
-            # print("c_attn key", key.shape)
-            # query shape: (batch_size, query_length, kv_heads, n_repeats, head_dim)
-            # key, value shape: (batch_size, query_length, kv_heads, 1, head_dim)
+                n_repeats = self.num_heads // self.kv_heads
+
+                query, key, value = (
+                    self.c_attn(hidden_states)
+                    .view(*hidden_states.shape[:2], self.kv_heads, n_repeats + 2, self.head_dim)
+                    .split((n_repeats, 1, 1), dim=3)
+                ) 
+                # query shape: (batch_size, query_length, kv_heads, n_repeats, head_dim)
+                # key, value shape: (batch_size, query_length, kv_heads, 1, head_dim)
 
         if layer_past is not None:
             past_kv_length = layer_past.shape[-2]
@@ -423,7 +591,7 @@ class GPTBigCodeAttention(nn.Module):
             past_kv_length = 0
 
 
-        if self.use_rotary_embeddings:
+        if self.use_rotary_embeddings and not USE_FLASH_ATTN:
             # query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
             # key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
             query = query.reshape(*query.shape[:2], self.num_heads, self.head_dim)
@@ -438,6 +606,7 @@ class GPTBigCodeAttention(nn.Module):
 
         if use_cache:
             key_value = torch.cat((key, value), dim=-1)
+            key_value = key_value.view(*key_value.shape[:2], 2 * self.kv_heads * self.head_dim)
             # TODO @nouamane: do we need to concat?
 
         if layer_past is not None:
@@ -446,13 +615,13 @@ class GPTBigCodeAttention(nn.Module):
             key, value = key_value.split(
                 (self.kv_heads * self.head_dim, self.kv_heads * self.head_dim), dim=-1
             )  # (batch_size, key_length, kv_heads * head_dim)
-            # print("after past", key[0,:,0])
 
         present = key_value if use_cache else None
-        attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
+        if not USE_FLASH_ATTN:
+            attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
-        if not self.multi_query:
-            attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
+            if not self.multi_query:
+                attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
@@ -461,7 +630,7 @@ class GPTBigCodeAttention(nn.Module):
             if self.multi_query:
                 # Transpose to return weights in the usual format (batch_size, num_heads, query_length, key_length)
                 attn_weights = attn_weights.transpose(1, 2)
-            outputs += (attn_weights,)
+            outputs += (attn_weights,) #TODO: fix for GQA
 
         return outputs  # a, present, (attentions)
 
@@ -514,6 +683,7 @@ class GPTBigCodeBlock(nn.Module):
         output_attentions: Optional[bool] = False,
         rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
         rotary_embedding_frequencies_k: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Union[
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
@@ -528,6 +698,7 @@ class GPTBigCodeBlock(nn.Module):
             output_attentions=output_attentions,
             rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
             rotary_embedding_frequencies_k=rotary_embedding_frequencies_k,
+            position_ids=position_ids,
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -552,6 +723,7 @@ class GPTBigCodeBlock(nn.Module):
                 output_attentions=output_attentions,
                 rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
                 rotary_embedding_frequencies_k=rotary_embedding_frequencies_k,
+                position_ids=position_ids,
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -778,8 +950,6 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        if attention_mask is not None:
-            assert attention_mask.all(), f"attention_mask: {attention_mask}"
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -819,6 +989,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         elif position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+        position_ids = position_ids.to(torch.int32) # For flash-attn with kv cache
 
         # Rotary frequencies
         rotary_embedding_frequencies_q = None
@@ -834,19 +1005,20 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         # Self-attention mask.
         query_length = input_shape[-1]
         key_length = past_length + query_length
-        self_attention_mask = self.bias[None, key_length - query_length : key_length, :key_length]
+        # self_attention_mask = self.bias[None, key_length - query_length : key_length, :key_length]
         # Sliding window attention
-        if self.config.attention_window_size is not None:
-            self_attention_mask.triu_(-self.config.attention_window_size + 1)
+        # if self.config.attention_window_size is not None:
+        #     self_attention_mask.triu_(-self.config.attention_window_size + 1)
 
-        if attention_mask is not None:
-            self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
-                dtype=torch.bool, device=self_attention_mask.device
-            )
+        # if attention_mask is not None:
+        #     self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
+        #         dtype=torch.bool, device=self_attention_mask.device
+        #     )
 
-        # MQA models: (batch_size, query_length, n_heads, key_length)
-        # MHA models: (batch_size, n_heads, query_length, key_length)
-        attention_mask = self_attention_mask.unsqueeze(2 if self.multi_query else 1)
+        # # MQA models: (batch_size, query_length, n_heads, key_length)
+        # # MHA models: (batch_size, n_heads, query_length, key_length)
+        # attention_mask = self_attention_mask.unsqueeze(2 if self.multi_query else 1)
+        attention_mask = attention_mask.to(dtype=torch.bool)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -903,6 +1075,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                             output_attentions,
                             rotary_embedding_frequencies_q,
                             rotary_embedding_frequencies_k,
+                            position_ids,
                         )
 
                     return custom_forward
@@ -928,6 +1101,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                     output_attentions=output_attentions,
                     rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
                     rotary_embedding_frequencies_k=rotary_embedding_frequencies_k,
+                    position_ids=position_ids,
                 )
 
             hidden_states = outputs[0]
