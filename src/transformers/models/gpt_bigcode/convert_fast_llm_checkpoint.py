@@ -5,22 +5,14 @@ import re
 
 import torch
 from transformers.models.gpt_bigcode.merge_fast_llm_checkpoint import merge_checkpoint
-from transformers.models.gpt_bigcode import GPTBigCodeConfig, GPTBigCodeForCausalLM, GPTBigCodeModel
+from transformers.models.gpt_bigcode import GPTBigCodeConfig
 
 
-# The simple map of names for "automated" rules.
-NAME_MAP = {
-    "_mlp._layer_1": "mlp.c_fc",
-    "_mlp._layer_2": "mlp.c_proj",
-    "layer_norm_1": "ln_1",
-    "layer_norm_2": "ln_2",
-    # "attention.dense": "attn.c_proj",
-    "self_attn.dense": "attn.c_proj",
-    # "self_attention.query_key_value": "attn.c_attn",
-}
-
-
-def convert_fast_llm_checkpoint(state_dict, config):
+def convert_fast_llm_checkpoint(state_dict, config, set_attn_dense_bias_zero, set_mlp_2_bias_zero, version=1):
+    if set_attn_dense_bias_zero:
+        print("Will set attention output layer biases to zero")
+    if set_mlp_2_bias_zero:
+        print("Will set MLP layer-2 biases to zero")
     # The converted output model.
     output_state_dict = {}
     if "window_size" in config:
@@ -35,6 +27,7 @@ def convert_fast_llm_checkpoint(state_dict, config):
         n_embd=config["hidden_size"],
         n_layer=config["num_layers"],
         n_head=config["num_attention_heads"],
+        head_groups=config.get("head_groups", None),
         n_inner=config["ffn_hidden_size"],
         activation_function="gelu",  # TODO
         multi_query=True,  # TODO
@@ -61,10 +54,11 @@ def convert_fast_llm_checkpoint(state_dict, config):
     )
 
     # Truncate the word embeddings to the vocab-size
-    word_embeddings = state_dict.pop("_layers.0._word_embeddings_weight")[:config.vocab_size, :]
+    u="_" if version==0 else ""
+    word_embeddings = state_dict.pop(f"{u}layers.0.{u}word_embeddings_weight")[:config.vocab_size, :]
     output_state_dict["transformer.wte.weight"] = word_embeddings
     if config.use_position_embeddings:
-        output_state_dict["transformer.wpe.weight"] = state_dict.pop("_layers.0._position_embeddings_weight")
+        output_state_dict["transformer.wpe.weight"] = state_dict.pop(f"{u}layers.0.{u}position_embeddings_weight")
 
     # Layer-0 is the word/position embeddings
     # Layers 1 to n_layer need to be re-mapped from 0 to n_layer-1.
@@ -73,12 +67,22 @@ def convert_fast_llm_checkpoint(state_dict, config):
     # Concatenate QKV matrix
     for layer_index in range(1, config.n_layer + 1):
         for weight_or_bias in ["weight", "bias"]:
-            query = state_dict.pop(f"_layers.{layer_index}.self_attn.query.{weight_or_bias}")
-            key_value = state_dict.pop(f"_layers.{layer_index}.self_attn.key_value.{weight_or_bias}")
+            query = state_dict.pop(f"{u}layers.{layer_index}.self_attn.query.{weight_or_bias}")
+            key_value = state_dict.pop(f"{u}layers.{layer_index}.self_attn.key_value.{weight_or_bias}")
             output_state_dict[f"transformer.h.{layer_index - 1}.attn.c_attn.{weight_or_bias}"] = torch.cat([query, key_value], dim=0)
-    
+
+    # The simple map of names for "automated" rules.
+    name_map = {
+        f"{u}mlp.{u}layer_1": "mlp.c_fc",
+        f"{u}mlp.{u}layer_2": "mlp.c_proj",
+        "layer_norm_1": "ln_1",
+        "layer_norm_2": "ln_2",
+        # "attention.dense": "attn.c_proj",
+        "self_attn.dense": "attn.c_proj",
+        # "self_attention.query_key_value": "attn.c_attn",
+    }
     # Extract the other ops
-    layer_re = re.compile("_layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
+    layer_re = re.compile(f"{u}layers\.(\d+)\.([a-z0-9_.]+)\.([a-z]+)")
     for name, value in state_dict.items():
         m = layer_re.match(name)
         assert m is not None, f"Invalid layer name: {name}"
@@ -94,8 +98,14 @@ def convert_fast_llm_checkpoint(state_dict, config):
         if op_name == "final_layernorm":
             assert layer_index == config.n_layer + 1
             output_state_dict[f"transformer.ln_f.{weight_or_bias}"] = value
+        # Bias was not used in training for InputParallel layers
+        elif op_name == "self_attn.dense" and weight_or_bias == "bias" and set_attn_dense_bias_zero:
+            output_state_dict[f"transformer.h.{layer_index-1}.{name_map[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
+        # MLP layer-2 is also InputParallel
+        elif op_name == f"{u}mlp.{u}layer_2" and weight_or_bias == "bias" and set_mlp_2_bias_zero:
+            output_state_dict[f"transformer.h.{layer_index-1}.{name_map[op_name]}.{weight_or_bias}"] = torch.zeros_like(value)
         else:
-            output_state_dict[f"transformer.h.{layer_index-1}.{NAME_MAP[op_name]}.{weight_or_bias}"] = value
+            output_state_dict[f"transformer.h.{layer_index-1}.{name_map[op_name]}.{weight_or_bias}"] = value
 
     # For LM head, transformers' wants the matrix to weight embeddings.
     output_state_dict["lm_head.weight"] = word_embeddings
@@ -115,6 +125,19 @@ def main(argv=None):
         type=Path,
         help="Path where the converted model is saved"
     )
+    parser.add_argument(
+        "--set_attn_dense_bias_zero",
+        action='store_true',
+        default=False,
+        help="Set the attention output layer bias to zero and ignore the value from the checkpoint. Shouldn't be used except to fix a bug from training."
+    )
+    parser.add_argument(
+        "--set_mlp_2_bias_zero",
+        action='store_true',
+        default=False,
+        help="Set the MLP second layer bias to zero and ignore the value from the checkpoint. Shouldn't be used except to fix a bug from training."
+    )
+    
     args = parser.parse_args(argv)
 
     state_dict, config = merge_checkpoint(
@@ -122,7 +145,7 @@ def main(argv=None):
         dummy_experiment_dir=None
     )
     
-    output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
+    output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config, args.set_attn_dense_bias_zero, args.set_mlp_2_bias_zero)
     
     print("Saving config")
     save_dir = args.save_dir or args.checkpoint_dir / "converted"

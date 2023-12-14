@@ -106,6 +106,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         n_embd=768,
         n_layer=12,
         n_head=12,
+        head_groups=None,
         n_inner=None,
         activation_function="gelu_pytorch_tanh",
         resid_pdrop=0.1,
@@ -142,11 +143,14 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.attention_softmax_in_fp32 = attention_softmax_in_fp32
         self.scale_attention_softmax_in_fp32 = scale_attention_softmax_in_fp32
-        self.multi_query = multi_query
         self.use_rotary_embeddings = use_rotary_embeddings
         self.rotary_embedding_scale = rotary_embedding_scale
         self.use_position_embeddings = use_position_embeddings if use_position_embeddings is not None else not use_rotary_embeddings
         self.attention_window_size = attention_window_size
+        if head_groups is None:
+            self.head_groups = 1 if multi_query else n_head
+        else:
+            self.head_groups = head_groups
 
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
