@@ -105,20 +105,24 @@ def convert_fast_llm_checkpoint(state_dict, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--checkpoint_dir",
-        type=Path,
-        help="Path to the experiment directory",
-    )
+    # parser.add_argument(
+    #     "--checkpoint_dir",
+    #     type=Path,
+    #     help="Path to the experiment directory",
+    # )
     parser.add_argument(
         "--save_dir",
         type=Path,
         help="Path where the converted model is saved"
     )
     args = parser.parse_args(argv)
-
+    # TODO(xrsrke): auto convert checkpoint_dir to Path
+    checkpoint_dir = "/admin/home/phuc_nguyen/.cache/huggingface/hub/models--HuggingFaceBR4--starcoder2_7b_4k_smol_data_580000/snapshots/92b6c25cab25f07c367bcc6d773635700a8a287d"
+    checkpoint_dir = Path(checkpoint_dir)
+    
     state_dict, config = merge_checkpoint(
-        args.checkpoint_dir,
+        # args.checkpoint_dir,
+        checkpoint_dir,
         dummy_experiment_dir=None
     )
     

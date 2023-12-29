@@ -15,7 +15,18 @@ def get_all_checkpoint_paths(experiment_path):
 
 
 def get_checkpoint_paths(checkpoint_dir: Path):
+    # model/model
     return [c_name for c_name in checkpoint_dir.glob("*") if re.match(r"\d+", c_name.name)]
+
+def get_safetensor_checkpoint_paths(checkpoint_dir: Path):
+    model_dir = checkpoint_dir / "model" / "model"  # Targeting the specific directory
+    safetensor_files = []
+
+    for file_path in model_dir.rglob("*.safetensors"):  # Looking for files with .safetensors extension
+        if file_path.is_file():  # Ensure it's a file
+            safetensor_files.append(file_path.absolute())  # Adding the absolute path of the file
+
+    return safetensor_files
 
 
 def extract_stage_shards(state):
@@ -58,18 +69,135 @@ def concatenate_tp_shards(stage_tp_shards, stage_content):
 def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     """Load a fast-llm checkpoint and merge the data, tensor, and pipeline-parallel shards"""
     # checkpoint_dir=experiment_dir/checkpoints/{iteration}
-    experiment_dir = checkpoint_dir.parent.parent
-    checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
-    config = yaml.safe_load((experiment_dir / "config.yaml").read_text())
+    # experiment_dir = "~/.cache/huggingface/hub/models--HuggingFaceBR4--starcoder2_7b_4k_smol_data_580000"
+    # experiment_dir = checkpoint_dir.parent.parent
+    
+    # NOTE: use the checkpoint format from https://huggingface.co/HuggingFaceBR4/starcoder2_7b_4k_smol_data_580000/tree/main/model/model/token_embeddings/pp_block/token_embedding
+    # where experiment_dir = checkpoint_dir
+    # checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_paths = get_safetensor_checkpoint_paths(checkpoint_dir)
+    config = yaml.safe_load((checkpoint_dir / "config.yaml").read_text())
+    
+    # def path2tfm_name(path):
+    #     name = path
+    #     # remove `_pp-rank*` and what comes after
+    #     name = name.split("_pp-rank-")[0]
+
+    #     # remove `.safetensors`
+    #     name = name.split(".safetensors")[0]
+
+    #     # remove base path
+    #     name = name.split(str(checkpoint_path) + "/model/")[1]
+
+    #     # "/" -> "."
+    #     name = name.replace("/", ".")
+
+    #     # remove "model." prefix if lm_head
+    #     if ".lm_head." in name:
+    #         name = name[len("model.") :]
+
+    #     # remove ".pp_block."
+    #     name = name.replace(".pp_block.", ".")
+
+    #     # apply mapping
+    #     name = apply_mappings(name, BRRR_TRFRS_NAME_MAPPING)
+    #     # print(name, path)
+
+    #     # skip buffers
+    #     if name.endswith(".model_inv_freq"):
+    #         continue
+    #     return name
 
     # Load the states from all the ranks
+    
+    import re
+
+    # def create_state_dict(paths):
+    #     state_dict = {}
+    #     for path in paths:
+    #         # Break down the path and extract relevant parts
+    #         parts = path.parts
+    #         # Find the tp-rank part and extract the rank number
+    #         tp_rank_match = re.search(r'tp-rank-(\d+)-of-\d+', str(path))
+    #         if tp_rank_match:
+    #             tp_rank = tp_rank_match.group(1)
+    #         else:
+    #             continue  # Skip if tp-rank is not found
+
+    #         # Construct the key from the path segments
+    #         key_segments = [part for part in parts if part not in ['model_weight', 'pp_block', 'model']]
+    #         key = '.'.join(key_segments[-5:])  # Adjust the index as needed to capture the right segments
+    #         key = key.replace('/', '.').replace('\\', '.') + '.' + tp_rank
+
+    #         # Add to the dictionary
+    #         state_dict[key] = path
+
+    #     return state_dict
+    
+    def create_state_dict(paths):
+        state_dict = {}
+        keyword_mapping = {
+            'model_bias': 'bias',
+            'model_weight': 'weight',
+        }
+
+        for path in paths:
+            tp_rank_match = re.search(r'tp-rank-(\d+)-of-\d+', str(path))
+            if tp_rank_match:
+                tp_rank = tp_rank_match.group(1)
+            else:
+                continue  # Skip if tp-rank is not found
+
+            file_name = path.stem
+
+            for key_word, replacement in keyword_mapping.items():
+                file_name = replacement
+
+            key = '.'.join(path.parts[-5:-1]) + '.' + file_name + '.' + tp_rank  # Modify indices as needed
+            state_dict[key] = path
+
+        return state_dict
+
+
+    state_dict = create_state_dict(checkpoint_paths)
+
+    from collections import defaultdict
+    grouped_paths = defaultdict(list)
+    for key, path in state_dict.items():
+        module_name, shard_number = key.rsplit('.', 1)
+        grouped_paths[module_name].append((int(shard_number), path))
+
+    sorted_grouped_paths = {module: sorted(paths, key=lambda x: x[0]) for module, paths in grouped_paths.items()}
+
+    from safetensors import safe_open
+
+    # path_demo = list(grouped_paths.values())[0]
+    _states = {}
+    _embedding_paths = sorted_grouped_paths["model.token_embeddings.pp_block.token_embedding.weight"]
+    for shard_id, _path in enumerate(_embedding_paths):
+        with safe_open(_path[1], framework="pt", device="cpu") as f:
+            for key in f.keys():
+                data = f.get_tensor(key)
+                _states[shard_id] = data
+    
+    tensor_list = [tensor for key, tensor in sorted(_states.items())]
+    _embeddings = torch.cat(tensor_list, dim=-1)
+    
+    assert 1 == 1
+
+        
     states = {
         int(c_name.name): torch.load(c_name)
         for c_name in tqdm(checkpoint_paths)
     }
-    num_stages = len(states[0]["stages"])
-    tensor_parallel = config["tensor_parallel"]
-    data_parallel_size = int(config["world_size"] / (tensor_parallel * config["pipeline_parallel"]))
+    # num_stages = len(states[0]["stages"])
+    
+    # tensor_parallel = config["tensor_parallel"]
+    # data_parallel_size = int(config["world_size"] / (tensor_parallel * config["pipeline_parallel"]))
+    tensor_parallel_size = config["parallelism"]["tp"]
+    pipeline_parallel_size = config["parallelism"]["pp"]
+    data_parallel_size = config["parallelism"]["dp"]
 
     if dummy_experiment_dir is not None:
         # Use the meta from the dummy checkpoint, and the shard from the actual checkpoint
@@ -78,7 +206,7 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
             int(c_name.name): torch.load(c_name)
             for c_name in tqdm(dummy_checkpoint_paths[-1])
         }
-        for rank, state in dummy_states.items():
+        for rank, state in dummy_states.aitems():
             state['shard'] = states[rank]['shard']
         states = dummy_states
 
@@ -86,8 +214,8 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     # {tp_rank: [[stage_0_shard_0, stage_0_shard_1, ...], [stage_1_shard_0, ...], ...]}
     # {tp_rank: [{fsdp_rank: shard}, ...]}
     fsdp_shards = {
-        i: [[None for _ in range(data_parallel_size)] for _ in range(num_stages)]
-        for i in range(tensor_parallel)
+        i: [[None for _ in range(data_parallel_size)] for _ in range(pipeline_parallel_size)]
+        for i in range(tensor_parallel_size)
     }
     
     for rank, state in states.items():
@@ -128,7 +256,7 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     return state_dict, config
 
 
-if __name__ == "__main__":
-    merge_checkpoint("/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/1B_repo_context_Top-level-Depth-first_pp2_64k_64k_2023_10_17_16_35_27/",
-                       dummy_experiment_dir="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/dev_1B_repo_context_Random_pp2_64k_64k_2023_10_18_22_20_36/")
+# if __name__ == "__main__":
+#     merge_checkpoint("/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/1B_repo_context_Top-level-Depth-first_pp2_64k_64k_2023_10_17_16_35_27/",
+#                        dummy_experiment_dir="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/dev_1B_repo_context_Random_pp2_64k_64k_2023_10_18_22_20_36/")
 
