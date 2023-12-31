@@ -171,18 +171,57 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     sorted_grouped_paths = {module: sorted(paths, key=lambda x: x[0]) for module, paths in grouped_paths.items()}
 
     from safetensors import safe_open
+    
+    assert 1 == 1
+    
+    MERGE_DIM_MAPPING = {
+        "token_embedding": 0, # row linear parallel
+        # NOTE: weird
+        "c_fc": 0, # column linear parallel
+        "c_proj": 0, # row linear parallel
+        # NOTE: weird
+        "query_key_value": 0, # row linear parallel
+        "dense": 1, # row linear parallel
+    }
+    
+    def find_corresponding_dim(name):
+        """
+        Searches the MERGE_DIM_MAPPING for a key that is a substring of the given name.
+        Returns the corresponding dimension if found, otherwise None.
+        """
+        for key, value in MERGE_DIM_MAPPING.items():
+            if key in name:
+                return value
+        return None
 
     # path_demo = list(grouped_paths.values())[0]
-    _states = {}
-    _embedding_paths = sorted_grouped_paths["model.token_embeddings.pp_block.token_embedding.weight"]
-    for shard_id, _path in enumerate(_embedding_paths):
-        with safe_open(_path[1], framework="pt", device="cpu") as f:
-            for key in f.keys():
-                data = f.get_tensor(key)
-                _states[shard_id] = data
+    _model_states = {}
+    for state_key, path in sorted_grouped_paths.items():
+        _model_states[state_key] = {}
+        for shard_id, _path in enumerate(path):
+            with safe_open(_path[1], framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    data = f.get_tensor(key)
+                    _model_states[state_key][shard_id] = data
+        
+        tensor_list = [tensor for _, tensor in sorted(_model_states[state_key].items())]
+        merge_dim = find_corresponding_dim(state_key)
+        print(f"trying to merge: {state_key}")
+        if state_key == "28.pp_block.attn.query_key_value.weight":
+            assert 1 == 1
+            
+        _model_states[state_key] = torch.cat(tensor_list, dim=merge_dim)
     
-    tensor_list = [tensor for key, tensor in sorted(_states.items())]
-    _embeddings = torch.cat(tensor_list, dim=-1)
+    # _states = {}
+    # _embedding_paths = sorted_grouped_paths["model.token_embeddings.pp_block.token_embedding.weight"]
+    # for shard_id, _path in enumerate(_embedding_paths):
+    #     with safe_open(_path[1], framework="pt", device="cpu") as f:
+    #         for key in f.keys():
+    #             data = f.get_tensor(key)
+    #             _states[shard_id] = data
+    
+    # tensor_list = [tensor for key, tensor in sorted(_states.items())]
+    # _embeddings = torch.cat(tensor_list, dim=0)
     
     assert 1 == 1
 
