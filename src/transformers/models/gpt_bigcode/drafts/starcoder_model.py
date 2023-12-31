@@ -16,7 +16,8 @@ if __name__ == "__main__":
         n_layer=config["num_hidden_layers"],
         n_head=config["num_attention_heads"],
         num_key_value_heads=config["num_kv_heads"],
-        n_inner=config["hidden_size"],
+        # NOTE: based on https://github.com/huggingface/brrr/blob/f569b93f80d03c626b24370d5ca4b1fe4f13fd76/brrr/models/fast/starcoder2.py#L194C16-L194C88
+        n_inner=config.get("n_inner", 4 * config["hidden_size"]),
         activation_function=config["activation_function"],
         resid_pdrop=config["resid_pdrop"],
         embd_pdrop=config["embd_pdrop"],
@@ -34,3 +35,5 @@ if __name__ == "__main__":
     )
 
     model = GPTBigCodeForCausalLM._from_config(model_config)
+
+    assert 1 == 1

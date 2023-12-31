@@ -126,17 +126,17 @@ def main(argv=None):
         dummy_experiment_dir=None
     )
     
-    output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
+    # output_state_dict, output_config = convert_fast_llm_checkpoint(state_dict, config)
     
-    print("Saving config")
-    save_dir = args.save_dir or args.checkpoint_dir / "converted"
-    output_config.save_pretrained(save_dir)
+    # print("Saving config")
+    # save_dir = args.save_dir or args.checkpoint_dir / "converted"
+    # output_config.save_pretrained(save_dir)
 
-    # Store the state_dict to file.
-    output_checkpoint_file = os.path.join(save_dir, "pytorch_model.bin")
-    print(f'Saving checkpoint to "{output_checkpoint_file}"')
-    torch.save(output_state_dict, output_checkpoint_file)
-    print(f'Done!')
+    # # Store the state_dict to file.
+    # output_checkpoint_file = os.path.join(save_dir, "pytorch_model.bin")
+    # print(f'Saving checkpoint to "{output_checkpoint_file}"')
+    # torch.save(output_state_dict, output_checkpoint_file)
+    # print(f'Done!')
 
 
 if __name__ == "__main__":

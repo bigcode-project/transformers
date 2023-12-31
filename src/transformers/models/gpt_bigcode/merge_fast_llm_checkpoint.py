@@ -176,8 +176,7 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     
     MERGE_DIM_MAPPING = {
         "token_embedding": 0, # row linear parallel
-        # NOTE: weird
-        "c_fc": 0, # column linear parallel
+        "c_fc": 1, # column linear parallel
         "c_proj": 0, # row linear parallel
         # NOTE: weird
         "query_key_value": 0, # row linear parallel
@@ -207,92 +206,105 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
         tensor_list = [tensor for _, tensor in sorted(_model_states[state_key].items())]
         merge_dim = find_corresponding_dim(state_key)
         print(f"trying to merge: {state_key}")
-        if state_key == "28.pp_block.attn.query_key_value.weight":
-            assert 1 == 1
+        # if state_key == "28.pp_block.attn.query_key_value.weight" or state_key == "2.pp_block.attn.query_key_value.weight":
+        #     assert 1 == 1
+        #     continue
             
-        _model_states[state_key] = torch.cat(tensor_list, dim=merge_dim)
-    
-    # _states = {}
-    # _embedding_paths = sorted_grouped_paths["model.token_embeddings.pp_block.token_embedding.weight"]
-    # for shard_id, _path in enumerate(_embedding_paths):
-    #     with safe_open(_path[1], framework="pt", device="cpu") as f:
-    #         for key in f.keys():
-    #             data = f.get_tensor(key)
-    #             _states[shard_id] = data
-    
-    # tensor_list = [tensor for key, tensor in sorted(_states.items())]
-    # _embeddings = torch.cat(tensor_list, dim=0)
+        # if state_key == "31.pp_block.ff.c_fc.weight" or state_key == "5.pp_block.attn.query_key_value.weight":
+        #     continue
+        
+        # if state_key == "5.pp_block.ff.c_fc.weight":
+        #     continue
+        
+        # if state_key == "17.pp_block.attn.query_key_value.weight":
+        #     continue
+        
+        # if state_key == "0.pp_block.ff.c_fc.weight" or state_key == "20.pp_block.attn.query_key_value.weight":
+        #     continue
+        
+        # if state_key == "18.pp_block.ff.c_fc.weight":
+        #     continue
+        
+        try:
+            _model_states[state_key] = torch.cat(tensor_list, dim=merge_dim)
+        except:
+            print(f"skipped {state_key}, {[x.shape for x in tensor_list]}")
     
     assert 1 == 1
 
-        
-    states = {
-        int(c_name.name): torch.load(c_name)
-        for c_name in tqdm(checkpoint_paths)
-    }
-    # num_stages = len(states[0]["stages"])
+    # print([f"{key}: {value.shape}" for key, value in _model_states.items() if isinstance(value, torch.Tensor)])
     
-    # tensor_parallel = config["tensor_parallel"]
-    # data_parallel_size = int(config["world_size"] / (tensor_parallel * config["pipeline_parallel"]))
-    tensor_parallel_size = config["parallelism"]["tp"]
-    pipeline_parallel_size = config["parallelism"]["pp"]
-    data_parallel_size = config["parallelism"]["dp"]
-
-    if dummy_experiment_dir is not None:
-        # Use the meta from the dummy checkpoint, and the shard from the actual checkpoint
-        dummy_checkpoint_paths = get_all_checkpoint_paths(dummy_experiment_dir)
-        dummy_states = {
-            int(c_name.name): torch.load(c_name)
-            for c_name in tqdm(dummy_checkpoint_paths[-1])
-        }
-        for rank, state in dummy_states.aitems():
-            state['shard'] = states[rank]['shard']
-        states = dummy_states
-
-    # Gather the data-parallel shards
-    # {tp_rank: [[stage_0_shard_0, stage_0_shard_1, ...], [stage_1_shard_0, ...], ...]}
-    # {tp_rank: [{fsdp_rank: shard}, ...]}
-    fsdp_shards = {
-        i: [[None for _ in range(data_parallel_size)] for _ in range(pipeline_parallel_size)]
-        for i in range(tensor_parallel_size)
-    }
+    for key, value in _model_states.items():
+        if isinstance(value, torch.Tensor):
+            print(f"key: {key}, value: {value.shape} \n")
     
-    for rank, state in states.items():
-        on_device_stage_shards = extract_stage_shards(state)
-        on_device_stage_indices = [i for (i, stage_meta) in enumerate(state["stages"]) if stage_meta["on_device"]]
-        for stage_index, stage_shard in zip(on_device_stage_indices, on_device_stage_shards):
-            stage_meta = state["stages"][stage_index]
-            # fsdp_shards[stage_meta["tp_rank"]][stage_index].append((stage_meta, stage_shard))
-            fsdp_shards[stage_meta["tp_rank"]][stage_index][stage_meta["fsdp_rank"]] = stage_shard
+    # states = {
+    #     int(c_name.name): torch.load(c_name)
+    #     for c_name in tqdm(checkpoint_paths)
+    # }
+    # # num_stages = len(states[0]["stages"])
     
-    # Concatenate the data-parallel shards
-    # and get individual weights
-    dp_concatenated_shards = {
-        tp_rank: [
-            extract_individual_weights(
-                torch.cat(stage_shards, dim=0),
-                states[0]["stages"][stage_index]['content']
-            )
-            for stage_index, stage_shards in enumerate(fsdp_shards[tp_rank])
-        ]
-        for tp_rank in range(config["tensor_parallel"])
-    }
+    # # tensor_parallel = config["tensor_parallel"]
+    # # data_parallel_size = int(config["world_size"] / (tensor_parallel * config["pipeline_parallel"]))
+    # tensor_parallel_size = config["parallelism"]["tp"]
+    # pipeline_parallel_size = config["parallelism"]["pp"]
+    # data_parallel_size = config["parallelism"]["dp"]
 
-    # In the tensor-parallel case, concatenate the TP tensors along their TP dimensions.
-    tp_concatenated_shards = []
-    for stage_index, stage_tp_shards in enumerate(zip(*(dp_concatenated_shards[i] for i in range(tensor_parallel)))):
-        stage_content = states[0]["stages"][stage_index]["content"]
-        tp_concatenated_shards.append(concatenate_tp_shards(stage_tp_shards, stage_content))
+    # if dummy_experiment_dir is not None:
+    #     # Use the meta from the dummy checkpoint, and the shard from the actual checkpoint
+    #     dummy_checkpoint_paths = get_all_checkpoint_paths(dummy_experiment_dir)
+    #     dummy_states = {
+    #         int(c_name.name): torch.load(c_name)
+    #         for c_name in tqdm(dummy_checkpoint_paths[-1])
+    #     }
+    #     for rank, state in dummy_states.aitems():
+    #         state['shard'] = states[rank]['shard']
+    #     states = dummy_states
 
-    # In the pipeline-parallel case, merge the stages
-    state_dict = {
-        weight_meta["name"]: weight
-        for stage_meta, stage_weights in zip(states[0]["stages"], tp_concatenated_shards)
-        for weight_meta, weight in zip(stage_meta["content"], stage_weights)
-    }
+    # # Gather the data-parallel shards
+    # # {tp_rank: [[stage_0_shard_0, stage_0_shard_1, ...], [stage_1_shard_0, ...], ...]}
+    # # {tp_rank: [{fsdp_rank: shard}, ...]}
+    # fsdp_shards = {
+    #     i: [[None for _ in range(data_parallel_size)] for _ in range(pipeline_parallel_size)]
+    #     for i in range(tensor_parallel_size)
+    # }
+    
+    # for rank, state in states.items():
+    #     on_device_stage_shards = extract_stage_shards(state)
+    #     on_device_stage_indices = [i for (i, stage_meta) in enumerate(state["stages"]) if stage_meta["on_device"]]
+    #     for stage_index, stage_shard in zip(on_device_stage_indices, on_device_stage_shards):
+    #         stage_meta = state["stages"][stage_index]
+    #         # fsdp_shards[stage_meta["tp_rank"]][stage_index].append((stage_meta, stage_shard))
+    #         fsdp_shards[stage_meta["tp_rank"]][stage_index][stage_meta["fsdp_rank"]] = stage_shard
+    
+    # # Concatenate the data-parallel shards
+    # # and get individual weights
+    # dp_concatenated_shards = {
+    #     tp_rank: [
+    #         extract_individual_weights(
+    #             torch.cat(stage_shards, dim=0),
+    #             states[0]["stages"][stage_index]['content']
+    #         )
+    #         for stage_index, stage_shards in enumerate(fsdp_shards[tp_rank])
+    #     ]
+    #     for tp_rank in range(config["tensor_parallel"])
+    # }
 
-    print(f"Total number of parameters: {sum([weight.numel() for weight in state_dict.values()])}")
-    return state_dict, config
+    # # In the tensor-parallel case, concatenate the TP tensors along their TP dimensions.
+    # tp_concatenated_shards = []
+    # for stage_index, stage_tp_shards in enumerate(zip(*(dp_concatenated_shards[i] for i in range(tensor_parallel)))):
+    #     stage_content = states[0]["stages"][stage_index]["content"]
+    #     tp_concatenated_shards.append(concatenate_tp_shards(stage_tp_shards, stage_content))
+
+    # # In the pipeline-parallel case, merge the stages
+    # state_dict = {
+    #     weight_meta["name"]: weight
+    #     for stage_meta, stage_weights in zip(states[0]["stages"], tp_concatenated_shards)
+    #     for weight_meta, weight in zip(stage_meta["content"], stage_weights)
+    # }
+
+    # print(f"Total number of parameters: {sum([weight.numel() for weight in state_dict.values()])}")
+    # return state_dict, config
 
 
 # if __name__ == "__main__":
