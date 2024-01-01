@@ -336,12 +336,68 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     
     assert 1 == 1
     
-    for key, value in _model_states.items():
-        if isinstance(value, torch.Tensor):
-            print(f"key: {key}, value: {value.shape} \n")
-        else:
-            print(f"skipped key: {key}, shape: {[x.shape for x in value.values()]} \n")
+    # for key, value in _model_states.items():
+    #     if isinstance(value, torch.Tensor):
+    #         print(f"key: {key}, value: {value.shape} \n")
+    #     else:
+    #         print(f"skipped key: {key}, shape: {[x.shape for x in value.values()]} \n")
     
+    
+    assert 1 == 1
+    
+    def remap_keys(target_dict):
+        new_dict = {}
+        for key, value in target_dict.items():
+            parts = key.split('.')
+
+            # Handling decoder blocks
+            if 'model.decoder' in key and 'pp_block' in key:
+                block_number = parts[2]
+                component_parts = parts[4:]
+                component = '.'.join(component_parts)
+
+                # Mapping specific components
+                component_map = {
+                    'ln_1.model_weight': 'ln_1.weight',
+                    'ln_1.model_bias': 'ln_1.bias',
+                    'ln_2.model_weight': 'ln_2.weight',
+                    'ln_2.model_bias': 'ln_2.bias',
+                    'attn.query_key_value.weight': 'attn.c_attn.weight',
+                    'attn.query_key_value.bias': 'attn.c_attn.bias',
+                    'attn.dense.weight': 'attn.c_proj.weight',
+                    'attn.dense.model_bias': 'attn.c_proj.bias',
+                    'ff.c_fc.weight': 'mlp.c_fc.weight',
+                    'ff.c_fc.bias': 'mlp.c_fc.bias',
+                    'ff.c_proj.weight': 'mlp.c_proj.weight',
+                    'ff.c_proj.model_bias': 'mlp.c_proj.bias'
+                }
+
+                new_component = component_map.get(component, component)
+                new_key = f"transformer.h.{block_number}.{new_component}"
+                new_dict[new_key] = value
+
+            # Handling final layer norm
+            elif key == 'model.final_layer_norm.pp_block.model_weight':
+                new_dict['transformer.ln_f.weight'] = value
+            elif key == 'model.final_layer_norm.pp_block.model_bias':
+                new_dict['transformer.ln_f.bias'] = value
+
+            # Handling token embeddings
+            elif key == 'model.token_embeddings.pp_block.token_embedding.weight':
+                new_dict['transformer.wte.weight'] = value
+
+        return new_dict
+
+    _model_states = remap_keys(_model_states)
+    
+    print("saving merged checkpoint...")
+    
+    torch.save(_model_states, './merged_checkpoints.pth')
+    
+    print("done")
+    
+    assert 1 == 1
+
     
     # states = {
     #     int(c_name.name): torch.load(c_name)
