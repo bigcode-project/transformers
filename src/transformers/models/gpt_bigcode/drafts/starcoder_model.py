@@ -36,4 +36,10 @@ if __name__ == "__main__":
 
     model = GPTBigCodeForCausalLM._from_config(model_config)
 
-    assert 1 == 1
+    print([x for x in model.state_dict().keys()])
+
+    print("----------------------------------------------------------------\n")
+    
+    for key, value in model.state_dict().items():
+        print(key, value.shape)
+
