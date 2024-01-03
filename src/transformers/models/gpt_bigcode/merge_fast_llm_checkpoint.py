@@ -6,6 +6,9 @@ import numpy as np
 import torch
 import yaml
 
+import re
+from os.path import commonprefix
+
 
 MERGE_DIM_MAPPING = {
     "ff.c_fc.bias": 0,
@@ -32,63 +35,15 @@ BRRR_TFMS_NAME_MAPPING = {
     'ff.c_proj.model_bias': 'mlp.c_proj.bias'
 }
 
-# def get_all_checkpoint_paths(experiment_path):
-#     checkpoints = (Path(experiment_path) / "checkpoints").glob("*")
-#     # Sort checkpoints by iteration number
-#     checkpoints = sorted(checkpoints, key=lambda x: int(x.name))
-#     return [get_checkpoint_paths(checkpoint) for checkpoint in checkpoints]
-
-
-# def get_checkpoint_paths(checkpoint_dir: Path):
-#     return [c_name for c_name in checkpoint_dir.glob("*") if re.match(r"\d+", c_name.name)]
-
 def get_safetensor_checkpoint_paths(checkpoint_dir: Path):
-    model_dir = checkpoint_dir / "model" / "model"  # Targeting the specific directory
+    model_dir = checkpoint_dir / "model" / "model"
     safetensor_files = []
 
-    for file_path in model_dir.rglob("*.safetensors"):  # Looking for files with .safetensors extension
-        if file_path.is_file():  # Ensure it's a file
-            safetensor_files.append(file_path.absolute())  # Adding the absolute path of the file
+    for file_path in model_dir.rglob("*.safetensors"):
+        if file_path.is_file():
+            safetensor_files.append(file_path.absolute())
 
     return safetensor_files
-
-
-# def extract_stage_shards(state):
-#     # Extract the weight shard and split it into the stage shards
-#     # Reproduce the split done in MultiStageModelBase.setup
-#     total_shard_size = sum(state['stage_shard_sizes'])
-#     if len(state['shard'].shape) == 1:
-#         # Flat buffer
-#         weight_shard = state['shard'][:total_shard_size]
-#     elif len(state['shard'].shape) == 2:
-#         # 2D buffer
-#         weight_shard = state['shard'][0]
-#     else:
-#         raise ValueError(f"Unrecognized buffer shape {state['shard'].shape}")
-#     return weight_shard.split(state['stage_shard_sizes'])
-
-
-# def extract_individual_weights(merged_stage_shard, stage_content):
-#     # Get individual weights from shards that are merged across data-parallel
-#     weights_numel = [np.prod(weight_meta['shape']) for weight_meta in stage_content]
-#     weights = merged_stage_shard[:sum(weights_numel)].split(weights_numel)
-#     return [weight.reshape(weight_meta['shape']) for weight, weight_meta in zip(weights, stage_content)]
-
-
-# def concatenate_tp_shards(stage_tp_shards, stage_content):
-#     # Concatenate the tp-shards in a given stage
-#     # Stage_tp_shards: contains the individual weight shards for each rank
-#     # [[weight1, weight2, ...] for rank in range(tp_size)]
-#     concatenated_weights = []
-#     # Concatenate each individual weight along their TP dimension if they have one.
-#     for weight_tp_shards, weight_meta in zip(zip(*stage_tp_shards), stage_content):
-#         if weight_meta["tensor_parallel_dim"] is not None:
-#             weight = torch.cat(weight_tp_shards, dim=weight_meta["tensor_parallel_dim"])
-#         else:
-#             weight = weight_tp_shards[0]
-#         concatenated_weights.append(weight)
-#     return concatenated_weights
-
 
 def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     """Load a fast-llm checkpoint and merge the data, tensor, and pipeline-parallel shards"""
@@ -97,14 +52,9 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
     # experiment_dir = checkpoint_dir.parent.parent
     
     # NOTE: use the checkpoint format from https://huggingface.co/HuggingFaceBR4/starcoder2_7b_4k_smol_data_580000/tree/main/model/model/token_embeddings/pp_block/token_embedding
-    # where experiment_dir = checkpoint_dir
-    # checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_paths = get_safetensor_checkpoint_paths(checkpoint_dir)
     config = yaml.safe_load((checkpoint_dir / "config.yaml").read_text())
-    
-    import re
-    from os.path import commonprefix
 
     def convert_paths_to_dict(paths):
         path_objs = [Path(p) for p in paths]
@@ -156,7 +106,6 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
             grouped_paths[key].append(path)
 
     def remove_keys_with_empty_lists(input_dict):
-        # Using dictionary comprehension to filter out keys with empty lists
         filtered_dict = {key: value for key, value in input_dict.items() if value}
         return filtered_dict
     
@@ -177,7 +126,6 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
                 return value
         return None
 
-    # path_demo = list(grouped_paths.values())[0]
     _model_states = {}
     for state_key, path in paths.items():
         _model_states[state_key] = {}
@@ -200,18 +148,7 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
         else:
             # NOTE: these are biases
             _model_states[state_key] = tensor_list[0]
-    
-    assert 1 == 1
-    
-    # for key, value in _model_states.items():
-    #     if isinstance(value, torch.Tensor):
-    #         print(f"key: {key}, value: {value.shape} \n")
-    #     else:
-    #         print(f"skipped key: {key}, shape: {[x.shape for x in value.values()]} \n")
-    
-    
-    assert 1 == 1
-    
+
     def remap_keys(target_dict):
         new_dict = {}
         for key, value in target_dict.items():
@@ -230,7 +167,6 @@ def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
             elif key == 'model.final_layer_norm.pp_block.model_bias':
                 new_dict['transformer.ln_f.bias'] = value
 
-            # Handling token embeddings
             elif key == 'model.token_embeddings.pp_block.token_embedding.weight':
                 new_dict['transformer.wte.weight'] = value
 
