@@ -9,16 +9,6 @@ import re
 from os.path import commonprefix
 
 
-MERGE_DIM_MAPPING = {
-    "ff.c_fc.bias": 0,
-    "token_embedding": 0, # row linear parallel
-    "c_fc": 0, # column linear parallel
-    "c_proj": 1, # row linear parallel
-    # NOTE: weird
-    "query_key_value": 0, # row linear parallel
-    "dense": 1, # row linear parallel
-}
-
 BRRR_TFMS_NAME_MAPPING = {
     'ln_1.model_weight': 'ln_1.weight',
     'ln_1.model_bias': 'ln_1.bias',
@@ -34,7 +24,19 @@ BRRR_TFMS_NAME_MAPPING = {
     'ff.c_proj.model_bias': 'mlp.c_proj.bias'
 }
 
-def get_safetensor_checkpoint_paths(checkpoint_dir: Path):
+MERGE_DIM_MAPPING = {
+    "token_embedding": 0, # row linear parallel
+    # NOTE: MLP layer
+    "c_fc": 0, # column linear parallel
+    "ff.c_fc.bias": 0,
+    "c_proj": 1, # row linear parallel
+    # NOTE: attention layer
+    "query_key_value": 0, # row linear parallel
+    "dense": 1, # row linear parallel
+}
+
+
+def _get_safetensor_checkpoint_paths(checkpoint_dir: Path):
     model_dir = checkpoint_dir / "model" / "model"
     safetensor_files = []
 
@@ -45,7 +47,7 @@ def get_safetensor_checkpoint_paths(checkpoint_dir: Path):
     return safetensor_files
 
 
-def transform_paths(paths):
+def _transform_paths(paths):
     path_objs = [Path(p) for p in paths]
     common_path_prefix = Path(commonprefix(path_objs)).parent
 
@@ -62,7 +64,7 @@ def transform_paths(paths):
 
     return final_paths
 
-def group_and_sort_paths(paths):
+def _group_and_sort_paths(paths):
     grouped_paths = defaultdict(list)
 
     for key, path in paths.items():
@@ -84,7 +86,7 @@ def group_and_sort_paths(paths):
 
     return sorted_grouped_paths
             
-def merge_checkpoints(paths):
+def _merge_checkpoints(paths):
     def find_corresponding_dim(name):
         for key, value in MERGE_DIM_MAPPING.items():
             if key in name:
@@ -111,7 +113,7 @@ def merge_checkpoints(paths):
             model_states[state_key] = tensor_list[0]
     return model_states
 
-def remap_keys(target_dict):
+def _remap_keys(target_dict):
     key_mapping = {
         'model.final_layer_norm.pp_block.model_weight': 'transformer.ln_f.weight',
         'model.final_layer_norm.pp_block.model_bias': 'transformer.ln_f.bias',
@@ -130,16 +132,17 @@ def remap_keys(target_dict):
             return key_mapping.get(key, key)
 
     new_dict = {get_new_key(key): value for key, value in target_dict.items()}
+    # NOTE: starcoder uses the same embedding matrix for token embedding and lm head
     new_dict["lm_head.weight"] = new_dict.get("transformer.wte.weight", new_dict.get("lm_head.weight"))
     
     return new_dict
 
-def merge_checkpoint(checkpoint_dir: Path):
+def merge_checkpoint(checkpoint_dir: Path) -> dict:
     """Load a checkpoint from the BRRR format and merge tensor parallel shards."""
-    checkpoint_paths = get_safetensor_checkpoint_paths(checkpoint_dir)
-    paths = transform_paths(checkpoint_paths)
-    paths = group_and_sort_paths(paths)
-    model_states = merge_checkpoints(paths)
-    model_states = remap_keys(model_states)
+    checkpoint_paths = _get_safetensor_checkpoint_paths(checkpoint_dir)
+    paths = _transform_paths(checkpoint_paths)
+    paths = _group_and_sort_paths(paths)
+    model_states = _merge_checkpoints(paths)
+    model_states = _remap_keys(model_states)
 
     return model_states

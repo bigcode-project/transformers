@@ -48,7 +48,7 @@ if __name__ == "__main__":
 
     model = GPTBigCodeForCausalLM._from_config(model_config, torch_dtype=torch.bfloat16)
     
-    checkpoint_path = Path("/fsx/phuc/projects/starcoder/transformers-starcoder/src/transformers/models/gpt_bigcode/merged_checkpoint.pth")
+    checkpoint_path = Path("/fsx/phuc/projects/starcoder/transformers-starcoder/src/transformers/models/gpt_bigcode/pytorch_model.pth")
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint)
     model = model.to("cuda")
