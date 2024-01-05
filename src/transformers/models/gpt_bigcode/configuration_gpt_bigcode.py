@@ -71,6 +71,8 @@ class GPTBigCodeConfig(PretrainedConfig):
             The dropout ratio for the attention.
         layer_norm_epsilon (`float`, *optional*, defaults to 1e-5):
             The epsilon to use in the layer normalization layers.
+        rope_theta (`int`, *optional*, defaults to 10000):
+            The theta value to use in the rotary position embeddings.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         scale_attn_weights (`bool`, *optional*, defaults to `True`):
@@ -121,6 +123,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         embd_pdrop=0.1,
         attn_pdrop=0.1,
         layer_norm_epsilon=1e-5,
+        rope_theta=10000,
         initializer_range=0.02,
         scale_attn_weights=True,
         use_cache=True,
@@ -152,6 +155,7 @@ class GPTBigCodeConfig(PretrainedConfig):
         self.embd_pdrop = embd_pdrop
         self.attn_pdrop = attn_pdrop
         self.layer_norm_epsilon = layer_norm_epsilon
+        self.rope_theta = rope_theta
         self.initializer_range = initializer_range
         self.scale_attn_weights = scale_attn_weights
         self.use_cache = use_cache
