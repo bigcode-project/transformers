@@ -39,7 +39,7 @@ from ...utils import (
     logging,
 )
 from .configuration_gpt_bigcode import GPTBigCodeConfig
-
+from apex.normalization import FusedLayerNorm as LayerNorm
 
 logger = logging.get_logger(__name__)
 
@@ -258,7 +258,7 @@ class GPTBigCodeAttention(nn.Module):
 
         if self.use_rotary_embeddings:
             self.maybe_rotary = (
-                StarcoderRotaryEmbedding(head_dim=self.head_dim)
+                StarcoderRotaryEmbedding(head_dim=self.head_dim, base=config.rope_theta)
                 if config.use_rotary_embeddings
                 else lambda q, k, t: (q, k)
             )
@@ -266,6 +266,7 @@ class GPTBigCodeAttention(nn.Module):
         self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.attn_pdrop = config.attn_pdrop
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
         self.prefill_kv_len = (
@@ -408,13 +409,21 @@ class GPTBigCodeAttention(nn.Module):
         # hidden_states (batch_size, query_length, embed_dim)
         # layer_past (batch_size, past_key_values_length, embed_dim)
         # sequence_mask (batch_size, query_length)
+        # print("hidden_states", hidden_states.shape)
+        # print(hidden_states[0])
 
         fused_qkv = self.c_attn(
             hidden_states
         )  # [batch_size, query_length, n_local_q_heads * head_dim + 2 * n_local_kv_heads * head_dim]
         batch_size, q_length, _ = fused_qkv.size()
+        # print("fused_qkv", fused_qkv.shape)
+        # print(fused_qkv[0])
 
+        
         qkv = fused_qkv.view(batch_size, q_length, self.n_local_kv_heads, self.n_repeats + 2, self.head_dim)
+        # print("qkv", qkv.shape)
+        # print(qkv[0])
+
         query, key, value = torch.split(qkv, [self.n_repeats, 1, 1], dim=3)
         query_states = query.reshape(
             batch_size, q_length, self.n_local_q_heads, self.head_dim
@@ -422,6 +431,10 @@ class GPTBigCodeAttention(nn.Module):
         key_states = key.reshape(batch_size, q_length, self.n_local_kv_heads, self.head_dim)
         value_states = value.reshape(batch_size, q_length, self.n_local_kv_heads, self.head_dim)
 
+        # print("query_states", query_states.shape)
+        # print(query_states[0])
+        # print("key_states", key_states.shape)
+        # print(key_states[0])
         # Compute rotary embeddings
         if layer_past is None:
             past_key_values_length = 0
@@ -430,6 +443,12 @@ class GPTBigCodeAttention(nn.Module):
         query_states, key_states = self.maybe_rotary(
             query_states, key_states, past_key_values_length=past_key_values_length
         )
+        # print("after rotary")
+        # print("query_states", query_states.shape)
+        # print(query_states[0])
+        # print("key_states", key_states.shape)
+        # print(key_states[0])
+        # assert False
     
         if layer_past is None:
             # First inference iteration (Prefill)
@@ -478,7 +497,7 @@ class GPTBigCodeAttention(nn.Module):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                dropout_p=0.0,
+                dropout_p=self.attn_pdrop,
                 softmax_scale=None,
                 causal=True,  # True in prefill phase, False in subsequent phases
                 return_attn_probs=False,
@@ -489,6 +508,10 @@ class GPTBigCodeAttention(nn.Module):
             )  # (batch_size, q_length, n_local_q_heads, d_v)
             pad_to_right(key_states, sequence_mask, new_tensor=k_cache)
             pad_to_right(value_states, sequence_mask, new_tensor=v_cache)
+
+            # print("attention_output", attention_output.shape)
+            # print(attention_output[0])
+            # # assert False
 
         else:
             # Pull pre-computed key/value states
@@ -509,6 +532,11 @@ class GPTBigCodeAttention(nn.Module):
                 batch_size, kv_length, self.n_local_kv_heads, self.head_dim
             )  # [batch_size, kv_length, self.n_local_kv_heads, self.head_dim]
 
+            # print("query_states", query_states.shape)
+            # print(query_states[0])
+            # print("key_states", key_states.shape)
+            # print(key_states[0])
+            # assert False
             position_offsets = position_ids[:, -1]
             # assert False
             attention_output = flash_attn_with_kvcache(
@@ -566,7 +594,7 @@ class GPTBigCodeAttention(nn.Module):
                 (self.head_dim, self.head_dim), dim=-1
             )  # (batch_size, query_length, 1 * head_dim)
         else: # GQA
-            if use_cache and USE_FLASH_ATTN:
+            if USE_FLASH_ATTN:
                 key, value, attn_output = self._flash_attn(hidden_states, layer_past, attention_mask, position_ids)
                 attn_output = attn_output.view(hidden_states.shape)
 
@@ -659,15 +687,15 @@ class GPTBigCodeBlock(nn.Module):
         hidden_size = config.hidden_size
         self.inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        self.ln_1 = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPTBigCodeAttention(config, layer_idx=layer_idx)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        self.ln_2 = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
             if config.multi_query:
                 raise NotImplementedError("Cross-attention not implemented for MQA")
             self.crossattention = GPTBigCodeAttention(config, is_cross_attention=True, layer_idx=layer_idx)
-            self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            self.ln_cross_attn = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPTBigCodeMLP(self.inner_dim, config)
 
@@ -688,7 +716,11 @@ class GPTBigCodeBlock(nn.Module):
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
         residual = hidden_states
+        # print("hidden_states", hidden_states.shape)
+        # print(hidden_states[0])
         hidden_states = self.ln_1(hidden_states)
+        # print("after ln 1", hidden_states.shape)
+        # print(hidden_states[0])
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
@@ -782,7 +814,7 @@ class GPTBigCodePreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
@@ -904,7 +936,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         max_positions = config.max_position_embeddings
         self.register_buffer(
