@@ -266,6 +266,7 @@ class GPTBigCodeAttention(nn.Module):
         self.c_proj = nn.Linear(self.embed_dim, self.embed_dim)
 
         self.attn_dropout = nn.Dropout(config.attn_pdrop)
+        self.attn_pdrop = config.attn_pdrop
         self.resid_dropout = nn.Dropout(config.resid_pdrop)
 
         self.prefill_kv_len = (
@@ -496,7 +497,7 @@ class GPTBigCodeAttention(nn.Module):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                dropout_p=0.0,
+                dropout_p=self.attn_pdrop,
                 softmax_scale=None,
                 causal=True,  # True in prefill phase, False in subsequent phases
                 return_attn_probs=False,
