@@ -2469,9 +2469,7 @@ class GenerationMixin:
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
                 if output_scores:
-                    scores += (next_tokens_scores,) if outputs.logits.shape[1] == 1 else (
-                        outputs.logits,
-                    )
+                    scores += (next_tokens_scores,)
                 if output_attentions:
                     decoder_attentions += (
                         (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)

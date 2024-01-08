@@ -14,11 +14,16 @@
 """PyTorch GPTBigCode model."""
 import math
 from typing import List, Optional, Tuple, Union
-from flash_attn import bert_padding
-from flash_attn.flash_attn_interface import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
+
+try:
+    from flash_attn import bert_padding
+    from flash_attn.flash_attn_interface import (
+        flash_attn_varlen_func,
+        flash_attn_with_kvcache,
+    )
+    FLASHATTN_IS_AVAILABLE = True
+except ImportError:
+    FLASHATTN_IS_AVAILABLE = False
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -39,7 +44,12 @@ from ...utils import (
     logging,
 )
 from .configuration_gpt_bigcode import GPTBigCodeConfig
-from apex.normalization import FusedLayerNorm as LayerNorm
+import warnings
+try:
+    from apex.normalization import FusedLayerNorm as LayerNorm
+except ImportError:
+    from torch.nn import LayerNorm
+    warnings.warn("Install NVIDIA Apex for apex.normalization.FusedLayerNorm to be available")
 
 logger = logging.get_logger(__name__)
 
@@ -314,8 +324,6 @@ class GPTBigCodeAttention(nn.Module):
             # No copy needed for MQA 2, or when layer_past is provided.
             query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
             # value shape (batch_size, key_length, 1, head_dim)
-            # print("value", value.shape)
-            # print(value[0, :, 0, 0])
         elif self.kv_heads < self.num_heads: # GQA
             # (batch_size, query_length, num_heads, head_dim) x (batch_size, kv_heads, head_dim, key_length)
             # -> (batch_size, num_heads, query_length, key_length)
@@ -338,8 +346,6 @@ class GPTBigCodeAttention(nn.Module):
             value = (value.view(batch_size, self.kv_heads, 1, key_length, self.head_dim)
                     .expand(batch_size, self.kv_heads, n_repeats, key_length, self.head_dim)
                     .reshape(batch_size, self.num_heads, key_length, self.head_dim))
-            # print("value", value.shape)
-            # print(value[0, :, 0])
         else:
             # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
             # -> (batch_size, num_heads, query_length, key_length)
@@ -350,11 +356,6 @@ class GPTBigCodeAttention(nn.Module):
             query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
             # No copy when layer_past is provided.
             key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
-
-        # print("query", query.shape)
-        # print(query[0, :query_length, 0])
-        # print("key", key.shape)
-        # print(key[0, 0, :])
 
         attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
         if query.device.type == "cpu":
@@ -368,9 +369,6 @@ class GPTBigCodeAttention(nn.Module):
         attn_weights = torch.baddbmm(attn_weights, query, key, beta=beta, alpha=scale_factor).view(attn_shape)
         # if not self.multi_query:
         #     attn_weights = attn_weights.transpose(1, 2) # (batch_size, query_length, num_heads, key_length)
-        # print("attn_weights", attn_weights.shape)
-        # print(attn_weights[0, :, 0, :])
-        # assert False, "done"
 
         if upcast:
             # Use a fused kernel to prevent a large overhead from casting and scaling.
@@ -409,20 +407,13 @@ class GPTBigCodeAttention(nn.Module):
         # hidden_states (batch_size, query_length, embed_dim)
         # layer_past (batch_size, past_key_values_length, embed_dim)
         # sequence_mask (batch_size, query_length)
-        # print("hidden_states", hidden_states.shape)
-        # print(hidden_states[0])
 
         fused_qkv = self.c_attn(
             hidden_states
         )  # [batch_size, query_length, n_local_q_heads * head_dim + 2 * n_local_kv_heads * head_dim]
         batch_size, q_length, _ = fused_qkv.size()
-        # print("fused_qkv", fused_qkv.shape)
-        # print(fused_qkv[0])
-
         
         qkv = fused_qkv.view(batch_size, q_length, self.n_local_kv_heads, self.n_repeats + 2, self.head_dim)
-        # print("qkv", qkv.shape)
-        # print(qkv[0])
 
         query, key, value = torch.split(qkv, [self.n_repeats, 1, 1], dim=3)
         query_states = query.reshape(
@@ -431,10 +422,6 @@ class GPTBigCodeAttention(nn.Module):
         key_states = key.reshape(batch_size, q_length, self.n_local_kv_heads, self.head_dim)
         value_states = value.reshape(batch_size, q_length, self.n_local_kv_heads, self.head_dim)
 
-        # print("query_states", query_states.shape)
-        # print(query_states[0])
-        # print("key_states", key_states.shape)
-        # print(key_states[0])
         # Compute rotary embeddings
         if layer_past is None:
             past_key_values_length = 0
@@ -443,12 +430,6 @@ class GPTBigCodeAttention(nn.Module):
         query_states, key_states = self.maybe_rotary(
             query_states, key_states, past_key_values_length=past_key_values_length
         )
-        # print("after rotary")
-        # print("query_states", query_states.shape)
-        # print(query_states[0])
-        # print("key_states", key_states.shape)
-        # print(key_states[0])
-        # assert False
     
         if layer_past is None:
             # First inference iteration (Prefill)
@@ -509,9 +490,6 @@ class GPTBigCodeAttention(nn.Module):
             pad_to_right(key_states, sequence_mask, new_tensor=k_cache)
             pad_to_right(value_states, sequence_mask, new_tensor=v_cache)
 
-            # print("attention_output", attention_output.shape)
-            # print(attention_output[0])
-            # # assert False
 
         else:
             # Pull pre-computed key/value states
@@ -532,13 +510,7 @@ class GPTBigCodeAttention(nn.Module):
                 batch_size, kv_length, self.n_local_kv_heads, self.head_dim
             )  # [batch_size, kv_length, self.n_local_kv_heads, self.head_dim]
 
-            # print("query_states", query_states.shape)
-            # print(query_states[0])
-            # print("key_states", key_states.shape)
-            # print(key_states[0])
-            # assert False
             position_offsets = position_ids[:, -1]
-            # assert False
             attention_output = flash_attn_with_kvcache(
                 query_states,
                 k_cache,
@@ -573,9 +545,6 @@ class GPTBigCodeAttention(nn.Module):
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
     ]:
-        USE_FLASH_ATTN = True
-        # self.multi_query = False
-        # self.multi_query = True
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn") or not self.is_cross_attention:
                 raise ValueError(
@@ -594,7 +563,7 @@ class GPTBigCodeAttention(nn.Module):
                 (self.head_dim, self.head_dim), dim=-1
             )  # (batch_size, query_length, 1 * head_dim)
         else: # GQA
-            if USE_FLASH_ATTN:
+            if FLASHATTN_IS_AVAILABLE:
                 key, value, attn_output = self._flash_attn(hidden_states, layer_past, attention_mask, position_ids)
                 attn_output = attn_output.view(hidden_states.shape)
 
@@ -619,15 +588,12 @@ class GPTBigCodeAttention(nn.Module):
             past_kv_length = 0
 
 
-        if self.use_rotary_embeddings and not USE_FLASH_ATTN:
+        if self.use_rotary_embeddings and not FLASHATTN_IS_AVAILABLE:
             # query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
             # key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
             query = query.reshape(*query.shape[:2], self.num_heads, self.head_dim)
             key = key.view(*key.shape[:2], self.kv_heads, self.head_dim)
-            # print(past_kv_length)
-            # print("before",key[0,:,0,0])
             query, key = self.maybe_rotary(query, key, past_kv_length)
-            # print("after",key[0,:,0,0])
             query = query.view(*query.shape[:2], self.num_heads * self.head_dim)
             key = key.view(*key.shape[:2], self.kv_heads * self.head_dim)
             value = value.reshape(*value.shape[:2], self.kv_heads*self.head_dim)
@@ -645,7 +611,7 @@ class GPTBigCodeAttention(nn.Module):
             )  # (batch_size, key_length, kv_heads * head_dim)
 
         present = key_value if use_cache else None
-        if not USE_FLASH_ATTN:
+        if not FLASHATTN_IS_AVAILABLE:
             attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
             if not self.multi_query:
@@ -716,11 +682,7 @@ class GPTBigCodeBlock(nn.Module):
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
         residual = hidden_states
-        # print("hidden_states", hidden_states.shape)
-        # print(hidden_states[0])
         hidden_states = self.ln_1(hidden_states)
-        # print("after ln 1", hidden_states.shape)
-        # print(hidden_states[0])
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,

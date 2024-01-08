@@ -1,148 +1,134 @@
 import re
+from tqdm import tqdm
 from pathlib import Path
 
+import numpy as np
 import torch
-from safetensors import safe_open
-from collections import defaultdict
-
-import re
-from os.path import commonprefix
+import yaml
 
 
-BRRR_TFMS_NAME_MAPPING = {
-    'ln_1.model_weight': 'ln_1.weight',
-    'ln_1.model_bias': 'ln_1.bias',
-    'ln_2.model_weight': 'ln_2.weight',
-    'ln_2.model_bias': 'ln_2.bias',
-    'attn.query_key_value.weight': 'attn.c_attn.weight',
-    'attn.query_key_value.bias': 'attn.c_attn.bias',
-    'attn.dense.weight': 'attn.c_proj.weight',
-    'attn.dense.model_bias': 'attn.c_proj.bias',
-    'ff.c_fc.weight': 'mlp.c_fc.weight',
-    'ff.c_fc.bias': 'mlp.c_fc.bias',
-    'ff.c_proj.weight': 'mlp.c_proj.weight',
-    'ff.c_proj.model_bias': 'mlp.c_proj.bias'
-}
-
-MERGE_DIM_MAPPING = {
-    "token_embedding": 0, # row linear parallel
-    # NOTE: MLP layer
-    "c_fc": 0, # column linear parallel
-    "ff.c_fc.bias": 0,
-    "c_proj": 1, # row linear parallel
-    # NOTE: attention layer
-    "query_key_value": 0, # row linear parallel
-    "dense": 1, # row linear parallel
-}
+def get_all_checkpoint_paths(experiment_path):
+    checkpoints = (Path(experiment_path) / "checkpoints").glob("*")
+    # Sort checkpoints by iteration number
+    checkpoints = sorted(checkpoints, key=lambda x: int(x.name))
+    return [get_checkpoint_paths(checkpoint) for checkpoint in checkpoints]
 
 
-def _get_safetensor_checkpoint_paths(checkpoint_dir: Path):
-    model_dir = checkpoint_dir / "model" / "model"
-    safetensor_files = []
-
-    for file_path in model_dir.rglob("*.safetensors"):
-        if file_path.is_file():
-            safetensor_files.append(file_path.absolute())
-
-    return safetensor_files
+def get_checkpoint_paths(checkpoint_dir: Path):
+    return [c_name for c_name in checkpoint_dir.glob("*") if re.match(r"\d+", c_name.name)]
 
 
-def _transform_paths(paths):
-    path_objs = [Path(p) for p in paths]
-    common_path_prefix = Path(commonprefix(path_objs)).parent
+def extract_stage_shards(state):
+    # Extract the weight shard and split it into the stage shards
+    # Reproduce the split done in MultiStageModelBase.setup
+    total_shard_size = sum(state['stage_shard_sizes'])
+    if len(state['shard'].shape) == 1:
+        # Flat buffer
+        weight_shard = state['shard'][:total_shard_size]
+    elif len(state['shard'].shape) == 2:
+        # 2D buffer
+        weight_shard = state['shard'][0]
+    else:
+        raise ValueError(f"Unrecognized buffer shape {state['shard'].shape}")
+    return weight_shard.split(state['stage_shard_sizes'])
 
-    final_paths = {}
-    for path in path_objs:
-        relative_path = str(path.relative_to(common_path_prefix))
-        dot_path = relative_path.replace('/', '.')
-        
-        weight_replaced = re.sub(r'model_weight_pp-rank-0-of-1_tp-rank-(\d)-of-4', r'weight.\1', dot_path)
-        bias_replaced = re.sub(r'model_bias_pp-rank-0-of-1_tp-rank-(\d)-of-4', r'bias.\1', weight_replaced)
-        cleaned_path = bias_replaced.replace('.safetensors', '')
 
-        final_paths[cleaned_path] = str(path)
+def extract_individual_weights(merged_stage_shard, stage_content):
+    # Get individual weights from shards that are merged across data-parallel
+    weights_numel = [np.prod(weight_meta['shape']) for weight_meta in stage_content]
+    weights = merged_stage_shard[:sum(weights_numel)].split(weights_numel)
+    return [weight.reshape(weight_meta['shape']) for weight, weight_meta in zip(weights, stage_content)]
 
-    return final_paths
 
-def _group_and_sort_paths(paths):
-    grouped_paths = defaultdict(list)
-
-    for key, path in paths.items():
-        try:
-            module_name, shard_number = key.rsplit('.', 1)
-            grouped_paths[module_name].append((int(shard_number), path))
-        except ValueError:
-            # NOTE: these are layer norm's weight and biases
-            # so it don't have shard number
-            grouped_paths[key].append(path)
-
-    # Remove any entries with empty lists
-    grouped_paths = {k: v for k, v in grouped_paths.items() if v}
-
-    # NOTE: Sort paths in each group
-    # module: [(4, path), (0, path), (3, path) ...] -> module: [(0, path), (1, path), (2, path) ...]
-    sorted_grouped_paths = {module: sorted(paths, key=lambda x: x[0])
-                            for module, paths in grouped_paths.items()}
-
-    return sorted_grouped_paths
-            
-def _merge_checkpoints(paths):
-    def find_corresponding_dim(name):
-        for key, value in MERGE_DIM_MAPPING.items():
-            if key in name:
-                return value
-        return None
-
-    model_states = {}
-    for state_key, path in paths.items():
-        model_states[state_key] = {}
-        for shard_id, _path in enumerate(path):
-            checkpoint_path = _path[1] if isinstance(_path, tuple) else _path
-            with safe_open(checkpoint_path, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    data = f.get_tensor(key)
-                    model_states[state_key][shard_id] = data
-        
-        tensor_list = [tensor for _, tensor in sorted(model_states[state_key].items())]
-        merge_dim = find_corresponding_dim(state_key)
-
-        if len(tensor_list) > 1:
-            model_states[state_key] = torch.cat(tensor_list, dim=merge_dim)
+def concatenate_tp_shards(stage_tp_shards, stage_content):
+    # Concatenate the tp-shards in a given stage
+    # Stage_tp_shards: contains the individual weight shards for each rank
+    # [[weight1, weight2, ...] for rank in range(tp_size)]
+    concatenated_weights = []
+    # Concatenate each individual weight along their TP dimension if they have one.
+    for weight_tp_shards, weight_meta in zip(zip(*stage_tp_shards), stage_content):
+        if weight_meta["tensor_parallel_dim"] is not None:
+            weight = torch.cat(weight_tp_shards, dim=weight_meta["tensor_parallel_dim"])
         else:
-            # NOTE: these are biases
-            model_states[state_key] = tensor_list[0]
-    return model_states
+            weight = weight_tp_shards[0]
+        concatenated_weights.append(weight)
+    return concatenated_weights
 
-def _remap_keys(target_dict):
-    key_mapping = {
-        'model.final_layer_norm.pp_block.model_weight': 'transformer.ln_f.weight',
-        'model.final_layer_norm.pp_block.model_bias': 'transformer.ln_f.bias',
-        'model.token_embeddings.pp_block.token_embedding.weight': 'transformer.wte.weight'
+
+def merge_checkpoint(checkpoint_dir: Path, dummy_experiment_dir=None):
+    """Load a fast-llm checkpoint and merge the data, tensor, and pipeline-parallel shards"""
+    # checkpoint_dir=experiment_dir/checkpoints/{iteration}
+    experiment_dir = checkpoint_dir.parent.parent
+    checkpoint_paths = get_checkpoint_paths(checkpoint_dir)
+    config = yaml.safe_load((experiment_dir / "config.yaml").read_text())
+
+    # Load the states from all the ranks
+    states = {
+        int(c_name.name): torch.load(c_name)
+        for c_name in tqdm(checkpoint_paths)
+    }
+    num_stages = len(states[0]["stages"])
+    tensor_parallel = config["tensor_parallel"]
+    data_parallel_size = int(config["world_size"] / (tensor_parallel * config["pipeline_parallel"]))
+
+    if dummy_experiment_dir is not None:
+        # Use the meta from the dummy checkpoint, and the shard from the actual checkpoint
+        dummy_checkpoint_paths = get_all_checkpoint_paths(dummy_experiment_dir)
+        dummy_states = {
+            int(c_name.name): torch.load(c_name)
+            for c_name in tqdm(dummy_checkpoint_paths[-1])
+        }
+        for rank, state in dummy_states.items():
+            state['shard'] = states[rank]['shard']
+        states = dummy_states
+
+    # Gather the data-parallel shards
+    # {tp_rank: [[stage_0_shard_0, stage_0_shard_1, ...], [stage_1_shard_0, ...], ...]}
+    # {tp_rank: [{fsdp_rank: shard}, ...]}
+    fsdp_shards = {
+        i: [[None for _ in range(data_parallel_size)] for _ in range(num_stages)]
+        for i in range(tensor_parallel)
+    }
+    
+    for rank, state in states.items():
+        on_device_stage_shards = extract_stage_shards(state)
+        on_device_stage_indices = [i for (i, stage_meta) in enumerate(state["stages"]) if stage_meta["on_device"]]
+        for stage_index, stage_shard in zip(on_device_stage_indices, on_device_stage_shards):
+            stage_meta = state["stages"][stage_index]
+            # fsdp_shards[stage_meta["tp_rank"]][stage_index].append((stage_meta, stage_shard))
+            fsdp_shards[stage_meta["tp_rank"]][stage_index][stage_meta["fsdp_rank"]] = stage_shard
+    
+    # Concatenate the data-parallel shards
+    # and get individual weights
+    dp_concatenated_shards = {
+        tp_rank: [
+            extract_individual_weights(
+                torch.cat(stage_shards, dim=0),
+                states[0]["stages"][stage_index]['content']
+            )
+            for stage_index, stage_shards in enumerate(fsdp_shards[tp_rank])
+        ]
+        for tp_rank in range(config["tensor_parallel"])
     }
 
-    def get_new_key(key):
-        if 'model.decoder' in key and 'pp_block' in key:
-            parts = key.split('.')
-            block_number = parts[2]
-            component_parts = parts[4:]
-            component = '.'.join(component_parts)
-            new_component = BRRR_TFMS_NAME_MAPPING.get(component, component)
-            return f"transformer.h.{block_number}.{new_component}"
-        else:
-            return key_mapping.get(key, key)
+    # In the tensor-parallel case, concatenate the TP tensors along their TP dimensions.
+    tp_concatenated_shards = []
+    for stage_index, stage_tp_shards in enumerate(zip(*(dp_concatenated_shards[i] for i in range(tensor_parallel)))):
+        stage_content = states[0]["stages"][stage_index]["content"]
+        tp_concatenated_shards.append(concatenate_tp_shards(stage_tp_shards, stage_content))
 
-    new_dict = {get_new_key(key): value for key, value in target_dict.items()}
-    # NOTE: starcoder uses the same embedding matrix for token embedding and lm head
-    new_dict["lm_head.weight"] = new_dict.get("transformer.wte.weight", new_dict.get("lm_head.weight"))
-    
-    return new_dict
+    # In the pipeline-parallel case, merge the stages
+    state_dict = {
+        weight_meta["name"]: weight
+        for stage_meta, stage_weights in zip(states[0]["stages"], tp_concatenated_shards)
+        for weight_meta, weight in zip(stage_meta["content"], stage_weights)
+    }
 
-def merge_checkpoint(checkpoint_dir: Path) -> dict:
-    """Load a checkpoint from the BRRR format and merge tensor parallel shards."""
-    checkpoint_paths = _get_safetensor_checkpoint_paths(checkpoint_dir)
-    paths = _transform_paths(checkpoint_paths)
-    paths = _group_and_sort_paths(paths)
-    model_states = _merge_checkpoints(paths)
-    model_states = _remap_keys(model_states)
+    print(f"Total number of parameters: {sum([weight.numel() for weight in state_dict.values()])}")
+    return state_dict, config
 
-    return model_states
+
+if __name__ == "__main__":
+    merge_checkpoint("/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/1B_repo_context_Top-level-Depth-first_pp2_64k_64k_2023_10_17_16_35_27/",
+                       dummy_experiment_dir="/toolkit_infiniband_example_checkpoints/ngc_checkpoints/sc2_ablations/dev_1B_repo_context_Random_pp2_64k_64k_2023_10_18_22_20_36/")
+
