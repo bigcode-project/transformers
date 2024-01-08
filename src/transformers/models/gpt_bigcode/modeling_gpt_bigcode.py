@@ -273,7 +273,35 @@ class GPTBigCodeAttention(nn.Module):
             #     .split((self.head_dim, 2 * self.head_dim), dim=3)
             # )
 
-            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            # query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)          
+            
+            # Split the KV tensors based on Megatron-LM's way
+            c_states = self.c_attn(hidden_states)
+            new_tensor_shape = hidden_states.size()[:-1] + (self.kv_heads, ((self.num_heads // self.kv_heads + 2)* self.head_dim),)
+            c_states= c_states.view(*new_tensor_shape)
+            (query, key, value) = torch.split(
+                c_states,
+                [
+                    (
+                        self.num_heads
+                        // self.kv_heads
+                        * self.head_dim
+                    ),
+                    self.head_dim,
+                    self.head_dim,
+                ],
+                dim=3,
+            )
+
+            query = query.reshape(query.size()[:-2] + (-1,))
+            key = key.reshape(key.size()[:-2] + (-1,))
+            value = value.reshape(value.size()[:-2] + (-1,))
+            key_value = torch.cat([key, value], dim=-1)
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            present = key_value if use_cache else None
+
+            key, value = key_value.split((self.kv_heads * self.head_dim), dim=-1)
             # key_value: (batch, sequence, 2 * kv_heads * head_dim)
 
             if layer_past is not None:
