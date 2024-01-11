@@ -78,16 +78,30 @@ def masked_softmax(x: torch.Tensor, mask: torch.Tensor, mask_value: torch.Tensor
     return x
 
 
+def _apply_rotary_embeddings(
+    tensor: torch.Tensor,
+    rope_frequencies: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Apply rotary embeddings to a tensor:
+    * Convert it to a complex, full-precision tensor
+    * Multiply by the frequencies
+    * Convert back tho the input format.
+    # TODO: Full precision only needed for bfloat16? (Doesn't support complex numbers)
+    """
+    complex_tensor = torch.view_as_complex(tensor.float().view(*tensor.shape[:-1], -1, rope_frequencies.size(-1), 2))
+    return torch.view_as_real(complex_tensor * rope_frequencies).view_as(tensor).type_as(tensor)
+
+
 class GPTBigCodeAttention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
         self.mask_value = None
 
-        self.multi_query = config.multi_query
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
-        self.kv_heads = 1 if self.multi_query else self.num_heads
+        self.kv_heads = config.head_groups
         self.kv_dim = self.kv_heads * self.head_dim
         self.split_size = self.embed_dim
         if self.head_dim * self.num_heads != self.embed_dim:
@@ -95,6 +109,7 @@ class GPTBigCodeAttention(nn.Module):
                 f"`embed_dim` must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`:"
                 f" {self.num_heads})."
             )
+        self.use_rotary_embeddings = config.use_rotary_embeddings
 
         self.scale_attn_weights = config.scale_attn_weights
         self.is_cross_attention = is_cross_attention
@@ -106,8 +121,8 @@ class GPTBigCodeAttention(nn.Module):
         )
 
         if self.is_cross_attention:
-            if self.multi_query:
-                raise NotImplementedError("Multi-Query Attention not supported for cross_attention")
+            if self.kv_heads != self.num_heads:
+                raise NotImplementedError("MQA / GQA not supported for cross_attention")
 
             self.c_attn = nn.Linear(self.embed_dim, 2 * self.embed_dim)
             self.q_attn = nn.Linear(self.embed_dim, self.embed_dim)
@@ -135,29 +150,29 @@ class GPTBigCodeAttention(nn.Module):
         if self.scale_attn_weights:
             scale_factor /= self.head_dim**0.5
 
-        # MQA models: (batch_size, query_length, num_heads * head_dim)
-        # MHA models: (batch_size, num_heads, query_length, head_dim)
+        # query: (batch_size, query_length, num_heads * head_dim)
         query_shape = query.shape
         batch_size = query_shape[0]
+        query_length = query_shape[1]
         key_length = key.size(-1)
-        if self.multi_query:
+        # MQA
+        if self.kv_heads == 1:
             # (batch_size, query_length, num_heads, head_dim) x (batch_size, head_dim, key_length)
             # -> (batch_size, query_length, num_heads, key_length)
-            query_length = query_shape[1]
             attn_shape = (batch_size, query_length, self.num_heads, key_length)
             attn_view = (batch_size, query_length * self.num_heads, key_length)
             # No copy needed for MQA 2, or when layer_past is provided.
             query = query.reshape(batch_size, query_length * self.num_heads, self.head_dim)
         else:
-            # (batch_size, num_heads, query_length, head_dim) x (batch_size, num_heads, head_dim, key_length)
-            # -> (batch_size, num_heads, query_length, key_length)
-            query_length = query_shape[2]
-            attn_shape = (batch_size, self.num_heads, query_length, key_length)
-            attn_view = (batch_size * self.num_heads, query_length, key_length)
-            # Always copies
-            query = query.reshape(batch_size * self.num_heads, query_length, self.head_dim)
-            # No copy when layer_past is provided.
-            key = key.reshape(batch_size * self.num_heads, self.head_dim, key_length)
+            heads_per_group = self.num_heads // self.kv_heads
+            attn_shape = (batch_size, self.kv_heads, query_length, heads_per_group, key_length)
+            attn_view = (batch_size * self.kv_heads, query_length * heads_per_group, key_length)
+            query = query.reshape(batch_size, query_length, self.kv_heads, heads_per_group, self.head_dim).transpose(1, 2)
+            query = query.reshape(batch_size * self.kv_heads, query_length * heads_per_group, self.head_dim)
+            key = key.reshape(batch_size * self.kv_heads, self.head_dim, key_length)
+            value = value.transpose(1, 2)  # (batch, kv_heads * head_dim, key_length)
+            value = value.reshape(batch_size * self.kv_heads, self.head_dim, key_length).transpose(1, 2)
+            # Attention Mask: (batch_size, query_length, 1, key_length)
 
         attn_weights = torch.empty(attn_view, device=query.device, dtype=query.dtype)
         if query.device.type == "cpu":
@@ -191,14 +206,18 @@ class GPTBigCodeAttention(nn.Module):
 
         # Mask heads if we want to
         if head_mask is not None:
-            if self.multi_query:
+            if self.kv_heads == 1:
                 head_mask = head_mask.transpose(1, 2)
             attn_weights = attn_weights * head_mask
 
-        if self.multi_query:
+        # MQA
+        if self.kv_heads == 1:
             attn_output = torch.bmm(attn_weights.view(attn_view), value).view(query_shape)
         else:
-            attn_output = torch.matmul(attn_weights, value)
+            # -> (batch_size * self.kv_heads, query_length * heads_per_group, head_dim)
+            attn_output = torch.bmm(attn_weights.view(attn_view), value)
+            attn_output = attn_output.reshape(batch_size, self.kv_heads, query_length, heads_per_group, self.head_dim).transpose(1, 2)
+            attn_output = attn_output.reshape(batch_size, query_length, self.kv_heads * heads_per_group * self.head_dim)
 
         return attn_output, attn_weights
 
@@ -212,10 +231,13 @@ class GPTBigCodeAttention(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
+        rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
+        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None
     ) -> Union[
         Tuple[torch.Tensor, Optional[torch.Tensor]],
         Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]],
     ]:
+        # hidden: (batch, sequence, hidden_size)
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn") or not self.is_cross_attention:
                 raise ValueError(
@@ -226,37 +248,57 @@ class GPTBigCodeAttention(nn.Module):
             query = self.q_attn(hidden_states)
             key_value = self.c_attn(encoder_hidden_states)
             attention_mask = encoder_attention_mask
-        elif self.multi_query:
+
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            present = key_value if use_cache else None
+
+            key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
+        elif self.kv_heads == 1:
             query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            present = key_value if use_cache else None
+
+            key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
         else:
             # Note: We split as (self.num_heads, 3, self.head_dim) instead of (3, self.num_heads, self.head_dim),
             # i.e., the memory layout is not the same as GPT2.
             # This makes the concatenation with past_key_value more efficient.
-            query, key_value = (
-                self.c_attn(hidden_states)
-                .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)
-                .transpose(1, 2)
-                .split((self.head_dim, 2 * self.head_dim), dim=3)
-            )
+            # query, key_value = (
+            #     self.c_attn(hidden_states)
+            #     .view(*hidden_states.shape[:2], self.num_heads, 3 * self.head_dim)  # (batch, sequence, num_heads, 3*head_dim)
+            #     .transpose(1, 2)  # (batch, num_heads, sequence, 3*head_dim)
+            #     .split((self.head_dim, 2 * self.head_dim), dim=3)
+            # )
 
-        if layer_past is not None:
-            key_value = torch.cat((layer_past, key_value), dim=-2)
-        present = key_value if use_cache else None
+            query, key_value = self.c_attn(hidden_states).split((self.embed_dim, 2 * self.kv_dim), dim=2)
+            # key_value: (batch, sequence, 2 * kv_heads * head_dim)
 
-        key, value = key_value.split((self.head_dim, self.head_dim), dim=-1)
+            if layer_past is not None:
+                key_value = torch.cat((layer_past, key_value), dim=-2)
+            present = key_value if use_cache else None
+
+            key, value = key_value.split((self.kv_heads * self.head_dim), dim=-1)
+
+        if self.use_rotary_embeddings:
+            query = _apply_rotary_embeddings(query, rotary_embedding_frequencies_q)
+            key = _apply_rotary_embeddings(key, rotary_embedding_frequencies_k)
 
         attn_output, attn_weights = self._attn(query, key.transpose(-1, -2), value, attention_mask, head_mask)
 
-        if not self.multi_query:
-            attn_output = attn_output.transpose(1, 2).reshape(hidden_states.shape)
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
         outputs = (attn_output, present)
         if output_attentions:
-            if self.multi_query:
+            if self.kv_heads == 1:
                 # Transpose to return weights in the usual format (batch_size, num_heads, query_length, key_length)
                 attn_weights = attn_weights.transpose(1, 2)
+            else:
+                # (batch_size, self.kv_heads, query_length, heads_per_group, key_length)
+                attn_weights = attn_weights.transpose(2, 3)
             outputs += (attn_weights,)
 
         return outputs  # a, present, (attentions)
@@ -291,8 +333,8 @@ class GPTBigCodeBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
-            if config.multi_query:
-                raise NotImplementedError("Cross-attention not implemented for MQA")
+            if config.head_groups < config.num_heads:
+                raise NotImplementedError("Cross-attention not implemented for MQA / GQA")
             self.crossattention = GPTBigCodeAttention(config, is_cross_attention=True, layer_idx=layer_idx)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
@@ -308,6 +350,8 @@ class GPTBigCodeBlock(nn.Module):
         encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
+        rotary_embedding_frequencies_q: Optional[torch.Tensor] = None,
+        rotary_embedding_frequencies_k: Optional[torch.Tensor] = None
     ) -> Union[
         Tuple[torch.Tensor], Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ]:
@@ -320,6 +364,8 @@ class GPTBigCodeBlock(nn.Module):
             head_mask=head_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
+            rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
+            rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
         )
         attn_output = attn_outputs[0]  # output_attn: a, present, (attentions)
         outputs = attn_outputs[1:]
@@ -342,6 +388,8 @@ class GPTBigCodeBlock(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_attention_mask=encoder_attention_mask,
                 output_attentions=output_attentions,
+                rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
+                rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
             )
             attn_output = cross_attn_outputs[0]
             # residual connection
@@ -502,11 +550,26 @@ GPT_BIGCODE_INPUTS_DOCSTRING = r"""
 class GPTBigCodeModel(GPTBigCodePreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        self.multi_query = config.multi_query
+        self.kv_heads = config.head_groups
         self.embed_dim = config.hidden_size
 
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        if config.use_position_embeddings:
+            self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        if config.use_rotary_embeddings:
+            # Calculate the complex frequencies (https://blog.eleuther.ai/rotary-embeddings/)
+            # `exp(i * n * a) = cos(n * a) + i sin(n * a)`,
+            # `a = theta ** - (2 * (channel // 2) / kv_channels)`,
+            # where n is the position in the sequence.
+            kv_channels = config.n_embd / config.n_head
+            angles = torch.outer(
+                torch.arange(config.max_position_embeddings, dtype=torch.float32),
+                torch.exp(
+                    config.rotary_embedding_scale
+                    * torch.arange(0, 1, 2 / kv_channels, dtype=torch.float32)
+                ),
+            )
+            self._rotary_embedding_frequencies = torch.polar(torch.ones_like(angles), angles)[None, :, None, :]
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPTBigCodeBlock(config, layer_idx=i) for i in range(config.num_hidden_layers)])
@@ -595,20 +658,32 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
         elif position_ids is None:
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+        
+        # Rotary frequencies
+        rotary_embedding_frequencies_q = None
+        rotary_embedding_frequencies_k = None
+        if self.config.use_rotary_embeddings:
+            rotary_embedding_frequencies_q = self._rotary_embedding_frequencies[:, past_length : past_length + input_shape[-1]].to(device=device)
+            rotary_embedding_frequencies_k = self._rotary_embedding_frequencies[:, :past_length + input_shape[-1], :, :].to(device=device)
 
         # Self-attention mask.
         query_length = input_shape[-1]
         key_length = past_length + query_length
         self_attention_mask = self.bias[None, key_length - query_length : key_length, :key_length]
+        # Sliding window attention
+        if self.config.attention_window_size is not None:
+            self_attention_mask.triu_(-self.config.attention_window_size + 1)
 
         if attention_mask is not None:
             self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
                 dtype=torch.bool, device=self_attention_mask.device
             )
 
-        # MQA models: (batch_size, query_length, n_heads, key_length)
-        # MHA models: (batch_size, n_heads, query_length, key_length)
-        attention_mask = self_attention_mask.unsqueeze(2 if self.multi_query else 1)
+        # Attention-shape: (batch_size, query_length, n_heads, key_length)
+        attention_mask = self_attention_mask.unsqueeze(2)
+        if self.kv_heads > 1:
+            # (batch_size, self.kv_heads, query_length, heads_per_group, key_length)
+            attention_mask = attention_mask.unsqueeze(1)
 
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -620,7 +695,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
             if encoder_attention_mask.dim() == 2:
                 encoder_attention_mask.unsqueeze(1)
             assert encoder_attention_mask.dim() == 3
-            encoder_attention_mask = encoder_attention_mask.bool().unsqueeze(2 if self.multi_query else 1)
+            encoder_attention_mask = encoder_attention_mask.bool().unsqueeze(2)
         else:
             encoder_attention_mask = None
 
@@ -632,8 +707,11 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        if self.config.use_position_embeddings:
+            position_embeds = self.wpe(position_ids)
+            hidden_states = inputs_embeds + position_embeds
+        else:
+            hidden_states = inputs_embeds
 
         if token_type_ids is not None:
             token_type_embeds = self.wte(token_type_ids)
@@ -656,7 +734,7 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, use_cache, output_attentions)
+                        return module(*inputs, use_cache, output_attentions, rotary_embedding_frequencies_q, rotary_embedding_frequencies_k)
 
                     return custom_forward
 
@@ -679,6 +757,8 @@ class GPTBigCodeModel(GPTBigCodePreTrainedModel):
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
                     output_attentions=output_attentions,
+                    rotary_embedding_frequencies_q=rotary_embedding_frequencies_q,
+                    rotary_embedding_frequencies_k=rotary_embedding_frequencies_k
                 )
 
             hidden_states = outputs[0]
