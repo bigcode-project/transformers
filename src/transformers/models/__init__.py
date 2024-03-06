@@ -202,6 +202,7 @@ from . import (
     speecht5,
     splinter,
     squeezebert,
+    starcoder2,
     stablelm,
     swiftformer,
     swin,
